@@ -32,3 +32,7 @@ See [PAYLOAD_ANALYZER.md](PAYLOAD_ANALYZER.md) for the input format, options, ca
 - Classifications describe the supplied syntax only. They do not establish that a request reached, executed on or
   affected the target.
 - Run tests with `python -I -m unittest discover -s tests` (Node.js on `PATH` enables the report script checks).
+
+## Licence
+
+MIT No Attribution ([LICENSE](LICENSE)): do whatever you want with it. Credits are welcome but not required.
