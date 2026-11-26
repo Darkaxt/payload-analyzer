@@ -10,6 +10,10 @@ Value-returning subqueries submitted inside error functions are classified as da
 
 Campaign examples and entry details retain their payload and add an untruncated, evidence-based Injected section when different from the whole value. JSON leaves include their key paths; deeper decoding layers are labelled. Error-based sections and the Error expression column retain complete balanced error calls alongside submitted subqueries. These excerpts make no claim about success or impact. Sections are computed once per displayed attack unit.
 
+## Database code execution and expression error channels (1.9.3)
+
+SQL phases distinguish probing (syntax, boolean, timing and capability checks, e.g. `1=1`), enumeration (structure, environment, row counts and value sizes, e.g. `SELECT COUNT(PASSWORDHASH) FROM APP.T`) and extraction (stored application values, e.g. `SELECT EMAIL FROM APP.T`). This applies across error, direct and blind channels. Nonconstant error-channel arguments appear as Submitted expression with a Kind column. Enumeration uses the metadata lane; extraction uses the data extraction / inference lane. Database-hosted Java execution, executable scheduler jobs and Java-extension XSLT use the command-execution lane: bare capability checks remain probes and supplied actions are exploitation attempts. Plain XSLT without extension namespaces remains SQL injection enumeration. JSON-leaf excerpts suppress ancestor and bracket-only duplicates. Classification does not establish execution or impact.
+
 ## Recommended pipeline
 
 ```
@@ -21,7 +25,7 @@ Both modes also write a `.determined` report before the extension chain, contain
 
 Pipeline includes unchanged baseline parameters by default so series and exclusion counts cover all traffic; `--assessor-matched-only` restores the former matched-only input. Direct resolved-input mode is unchanged.
 
-Pipeline options: `--keep-resolutions PATH`, `--xor-key-hex HEX`, `--decode-depth N` (1–8, default 4), and `--exclude-not-attack`. Resolutions use a temporary `.pax` in the output folder, removed even on failure; an optional retained copy follows PATH's extension. Existing direct usage remains `python -I payload_analyzer.py RESOLUTIONS -o OUT`. Occurrences include URL-decoded `dec_value`; units include `final_decoded_value` from the longest decoding chain (lowest node ID breaks ties).
+Pipeline options: `--keep-resolutions PATH`, `--xor-key-hex HEX`, `--decode-depth N` (1â€“8, default 4), and `--exclude-not-attack`. Resolutions use a temporary `.pax` in the output folder, removed even on failure; an optional retained copy follows PATH's extension. Existing direct usage remains `python -I payload_analyzer.py RESOLUTIONS -o OUT`. Occurrences include URL-decoded `dec_value`; units include `final_decoded_value` from the longest decoding chain (lowest node ID breaks ties).
 
 Both stages support plain JSON/JSONL, `.gz` and `.pax`. `paxio.py pack IN OUT` and `unpack IN OUT` preserve decoded input bytes, including a byte-order marker and line endings. `cat IN` prints decoded text without a plain intermediate. Atomic output temporaries use the final container format. Gzip output has a fixed timestamp and empty filename.
 
@@ -211,9 +215,9 @@ Report views (1.8.1):
   label describes the network only: a hosting or ISP address can still be a proxy or VPN exit, which AbuseIPDB does
   not establish.
 - Blind inference (1.8.2): one row per extracted expression with the value read so far, e.g. `[AB][RS]T`
-  (`[ab]` = one of, `·` = undetermined, `!` = inconsistent thresholds). The answer to the last comparison of each
+  (`[ab]` = one of, `Â·` = undetermined, `!` = inconsistent thresholds). The answer to the last comparison of each
   position is not in the request log, so a character usually narrows to two candidates; a stop does not prove an
-  answer (checked against known values). Click a row for each position's comparisons (`63↑ 95↓ … 65?`:
+  answer (checked against known values). Click a row for each position's comparisons (`63â†‘ 95â†“ â€¦ 65?`:
   arrow = direction of the attacker's next threshold). Literal check strings are verified against their bounds.
 
 ## Verification

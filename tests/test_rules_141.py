@@ -115,7 +115,7 @@ class Rules141Tests(unittest.TestCase):
 
     def test_priority_and_versions(self):
         self.assertEqual('1.4.1', a.RULE_CATALOGUE_VERSION)
-        self.assertEqual('1.9.2', a.ANALYZER_VERSION)
+        self.assertEqual('1.9.3', a.ANALYZER_VERSION)
         for value, expected in (('http://localhost/ {{7*7}}', 'rce'), ('http://localhost/ file:///opt/sample/a', 'file_access'), ('http://localhost/ (SELECT 2)', 'sqli'), ('http://localhost/ <script>alert(2)</script>', 'xss')):
             self.assertEqual(expected, self.result(value)['category'])
 

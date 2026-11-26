@@ -98,6 +98,12 @@ class AnalyzerTests(unittest.TestCase):
                 if expected:
                     self.assertIn('sqli.boolean_tautology', result['rule_ids'])
                 a.validate(result, nodes)
+        rid = 'rce.database_code_execution'
+        for value, expected in [('DBMS_' + "JAVA.RUNJAVA('example.Task')", True),
+                                ("DBMS_SCHEDULER.CREATE_JOB(job_type=>'PLSQL_BLOCK')", False)]:
+            result = a.analyze([{'node_id': 0, 'value': value}])
+            self.assertEqual(rid in result['rule_ids'], expected)
+            (positives if expected else negatives).add(rid)
         catalogue = {r[_text(15)] for r in a.CATALOGUE
                      if r['handler'] not in ('file_access', 'include_wrapper_execution')
                      and r['handler'] not in a._DATA.get('generic_probe', {})}  # Covered in test_rules_140.

@@ -328,6 +328,14 @@ def _strip_parens(expr):
     return expr
 
 
+def _inference_comparison(text, end):
+    """Allow redundant parentheses between a measured expression and its comparison."""
+    if end < 0:
+        return None
+    closing = re.match(r'\s*\)*\s*', text[end:])
+    return _CMP.match(text, end + closing.end())
+
+
 def extract_inference(text):
     """Find blind-inference comparisons: (kind, expression, position, operator, threshold)."""
     found = []
@@ -345,13 +353,13 @@ def extract_inference(text):
             found.append(('char', clip(_strip_parens(args[0]), MAX_VALUE), int(args[1]), cmp_.group(1), int(cmp_.group(2))))
     for m in re.finditer(r'\b(LENGTH|LEN|CHAR_LENGTH)\s*\(', text, re.I):
         end = _balanced(text, m.end() - 1)
-        cmp_ = _CMP.match(text, end) if end > 0 else None
+        cmp_ = _inference_comparison(text, end)
         if cmp_:
             found.append(('length', clip(_strip_parens(text[m.end():end - 1]), MAX_VALUE), 0, cmp_.group(1),
                           int(cmp_.group(2))))
     for m in re.finditer(r'\(\s*SELECT\s+COUNT\s*\(', text, re.I):
         end = _balanced(text, m.start())
-        cmp_ = _CMP.match(text, end) if end > 0 else None
+        cmp_ = _inference_comparison(text, end)
         if cmp_:
             found.append(('count', clip(_strip_parens(text[m.start():end]), MAX_VALUE), 0, cmp_.group(1),
                           int(cmp_.group(2))))
@@ -364,7 +372,7 @@ def _sql_mask(text):
 
 
 def extract_error_channel(text, expressions=False):
-    """Return error functions and their verbatim scalar subqueries, not observed results."""
+    """Return error functions and submitted nonconstant expressions, not observed results."""
     if not _ERROR_CHANNEL.search(text):
         return []
     masked = _sql_mask(text)
@@ -387,9 +395,15 @@ def extract_error_channel(text, expressions=False):
             if stop < 0 or stop > end or any(a <= start < b for a, b in queries):
                 continue
             queries.append((start, stop))
-        if queries:
-            found.append((text[call.start():end] if expressions else name,
-                          [text[a + 1:b - 1] for a, b in queries]))
+        submitted = [text[a + 1:b - 1] for a, b in queries]
+        if not queries:
+            for arg in _split_args(text[call.end():end - 1]):
+                expr = _strip_parens(arg)
+                constant = re.sub(r"'(?:''|[^'])*'|\bNULL\b|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", '', expr, flags=re.I)
+                if re.search(r'[A-Za-z_$\"]', constant):
+                    submitted.append(expr)
+        if submitted:
+            found.append((text[call.start():end] if expressions else name, submitted))
     return found
 
 
@@ -486,7 +500,7 @@ def file_target(path):
 
 
 # Probing vs exploitation attempt (payload content only; says nothing about the outcome).
-PHASES = ('probing', 'exploitation')
+PHASES = ('probing', 'enumeration', 'extraction', 'exploitation')
 # Commands whose only purpose is to show that execution happens (markers, delays, identity, callbacks).
 _PROBE_PROGRAMS = {'sleep', 'echo', 'printf', 'ping', 'nslookup', 'dig', 'host', 'id', 'who' + 'ami', 'uname',
                    'hostname', 'expr', 'true', 'false', 'timeout', 'pwd', 'ver', 'set', 'type', 'cmd', 'sh', 'bash',
@@ -515,6 +529,20 @@ _XSS_EXPLOIT = re.compile(r'document\s*\.\s*cookie|localStorage|sessionStorage|\
 _METADATA_HOSTS = ('169.254.169.254', 'metadata.google.internal', '100.100.100.200', 'fd00:ec2::254', '169.254.170.2')
 
 
+def _size_measurement(expr):
+    """Count/size aggregates, including wrappers, rather than stored values."""
+    expr = _strip_parens(expr.strip())
+    match = re.match(r'(COUNT|LENGTH|LEN|CHAR_LENGTH|MAX|MIN|NVL|COALESCE)\s*\(', expr, re.I)
+    if not match or _balanced(expr, match.end() - 1) != len(expr):
+        return False
+    args = _split_args(expr[match.end():-1])
+    if match.group(1).upper() in ('COUNT', 'LENGTH', 'LEN', 'CHAR_LENGTH'):
+        return not re.search(r'\bSELECT\b', expr, re.I)
+    return bool(args) and _size_measurement(args[0]) and all(
+        _size_measurement(arg) or re.fullmatch(r"(?:NULL|[+-]?\d+(?:\.\d+)?|'(?:''|[^'])*')", arg, re.I)
+        for arg in args[1:])
+
+
 def phase_of(cat, lane, rules, analysis, text, error_calls=None):
     """'probing' (tests whether the injection point reacts, fingerprints, enumerates) or 'exploitation'
     (tries to read stored data or non-canary files, run non-diagnostic commands, download/write files,
@@ -524,17 +552,87 @@ def phase_of(cat, lane, rules, analysis, text, error_calls=None):
     if cat == 'sqli':
         if error_calls is None:
             error_calls = extract_error_channel(text)
-        if error_calls or _SQL_EXPLOIT.search(up):
-            return 'exploitation'
-        for m in _SELECT_FROM.finditer(up):
-            cols, t = m.group(1).strip(), m.group(2).strip('`"[]')
+        if _SQL_EXPLOIT.search(up):
+            return 'extraction'
+        phases = []
+        inference = extract_inference(text)
+        # A measured scalar subquery is not a returned stored value. Scope the
+        # channel before inspecting SELECTs nested inside it.
+        spans = []
+        for call in re.finditer(r'\b(?:ASCII|UNICODE|ORD|LENGTH|LEN|CHAR_LENGTH)\s*\(', text, re.I):
+            end = _balanced(text, call.end() - 1)
+            cmp_ = _inference_comparison(text, end)
+            if cmp_ and extract_inference(text[call.start():cmp_.end()]):
+                spans.append((call.start(), cmp_.end()))
+        # Null predicates test existence, including balanced function calls and
+        # scalar subqueries; do not mistake their inner SELECT for a returned value.
+        for expr in re.finditer(r'\b[\w@$]+(?:\.[\w$]+)*\s*\(|\(', text):
+            end = _balanced(text, expr.end() - 1)
+            null = re.match(r'\s+IS\s+(?:NOT\s+)?NULL\b', text[end:], re.I) if end > 0 else None
+            if null:
+                spans.append((expr.start(), end + null.end()))
+        remaining = ''.join(' ' if any(a <= i < b for a, b in spans) else ch
+                            for i, ch in enumerate(text))
+        existence = not error_calls and not re.search(r'\bUNION\b', up) and bool(re.search(
+            r'\bEXISTS\s*\(|\bSELECT\s+(?:COUNT\s*\(\s*(?:\*|1)\s*\)|1)\s+FROM\b[^;]*?\)\s*(?:>|>=|=|<|<=|!=|<>)\s*[01](?![\d.])|\b1\s*=\s*\(\s*SELECT\s+1\s+FROM\b', up))
+        # Look ahead so a scalar SELECT nested in an outer SELECT is considered too.
+        for match in re.finditer(r'(?=\bSELECT\s+(.*?)\s+FROM\s+([A-Z0-9_$.`"\[\]]+))', up, re.S):
+            if any(a <= match.start() < b for a, b in spans):
+                continue
+            cols, table = match.group(1).strip(), match.group(2).strip('`"[]')
+            if 'SELECT' in cols:
+                continue
             if cols.startswith('DISTINCT '):
                 cols = cols[9:]
-            if (t and t != 'DUAL' and not _DICT.search(t) and not _SCHEMA_ENUM.search(t) and t != 'SYSIBM.SYSDUMMY1'
-                    and not _PROBE_SELECT.match(cols)):
-                return 'exploitation'
+            if cols == '1' and re.search(r'\bIN\s*\(\s*$', up[:match.start()]):
+                continue
+            if existence and (_PROBE_SELECT.fullmatch(cols) or re.search(r'\bEXISTS\s*\(', up)):
+                continue
+            target = inference_target('SELECT ' + cols + ' FROM ' + table)
+            measured = _size_measurement(cols)
+            credential = (table in ('SYS.USER$', 'DBA_USERS', 'SYS.DBA_USERS', 'SYS.SQL_LOGINS')
+                          and re.search(r'\b(?:PASSWORD|SPARE4|PASSWORD_HASH)\b', cols))
+            if credential and not measured:
+                phases.append('extraction')
+                continue
+            if target.startswith('stored data:'):
+                phases.append('enumeration' if measured or _PROBE_SELECT.fullmatch(cols) else 'extraction')
+            elif table in ('DUAL', 'SYSIBM.SYSDUMMY1'):
+                if not _PROBE_SELECT.fullmatch(cols):
+                    phases.append('enumeration')
+            else:
+                phases.append('enumeration')
+        for kind, expr, _, _, threshold in inference:
+            if re.fullmatch(r"(?:SELECT\s+)?(?:'(?:''|[^'])*'|[+-]?\d+(?:\.\d+)?|NULL)", _strip_parens(expr), re.I):
+                continue
+            if (existence and kind == 'count') or (threshold in (0, 1) and not error_calls):
+                continue
+            target = inference_target(expr)
+            if target.startswith('stored data:'):
+                phases.append('enumeration' if kind in ('length', 'count') else 'extraction')
+            elif target != 'other expression':
+                phases.append('enumeration')
+        if 'extraction' in phases:
+            return 'extraction'
+        if existence and not phases:
+            return 'probing'
+        remaining = re.sub(r'(?:@@\w+|\b(?:USER|CURRENT_USER|SESSION_USER|VERSION))\s+IS\s+(?:NOT\s+)?NULL\b', '', remaining, flags=re.I)
+        if phases or error_calls or re.search(r'\b(?:USER|CURRENT_USER|SYS_CONTEXT|VERSION)\b|@@\w+', remaining, re.I):
+            return 'enumeration'
         return 'probing'
     if cat == 'rce':
+        if 'rce.database_code_execution' in rules:
+            calls = list(re.finditer(r'\bDBMS_' + r'JAVA(?:_TEST)?\s*\.\s*(RUNJAVA|FUNCALL|SET_OUTPUT_TO_JAVA)\s*\(', text, re.I))
+            for match in calls:
+                end = _balanced(text, match.end() - 1)
+                args = _split_args(text[match.end():end - 1]) if end > 0 else []
+                if args and (len(args) > 1 or re.search(r'\s', args[0].strip("'\" "))):
+                    return 'exploitation'
+            if re.search(r"\b(?:job_action|program_action)\s*=>\s*'[^']+'|\bJAVA\s+SOURCE\b", text, re.I):
+                return 'exploitation'
+            if re.search(r'\bselect\s*=\s*[\"\'][^\"\']*:[\w.-]+\s*\([^)]*[^\s()]', text, re.I):
+                return 'exploitation'
+            return 'probing'
         if lane == 'file write':
             return 'exploitation'
         if lane == 'callback / download':
@@ -566,6 +664,8 @@ def phase_of(cat, lane, rules, analysis, text, error_calls=None):
 
 
 def lane_of(cat, rules):
+    if cat == 'rce' and 'rce.database_code_execution' in rules:
+        return 'command execution'
     lanes = LANES.get(cat, ('payload',))
     probes = ('template_expression', 'os_command_recon')
     best = 1 if cat == 'rce' and (not rules or any(not any(f in r for f in probes) for r in rules)) else 0
@@ -593,6 +693,15 @@ def injected_sections(unit, analysis):
                 if technique.get('rule_id') == 'sqli.error_based':
                     errors.add(nid)
     result, seen = [], set()
+    plain_ancestors = set()
+    for leaf in nodes:
+        if leaf.get("transform") == "json_leaf_extract" and leaf["node_id"] in quotes:
+            parent = leaf.get("parent_node_id")
+            visited = set()
+            while parent in by_id and parent not in visited:
+                visited.add(parent)
+                plain_ancestors.add(parent)
+                parent = by_id[parent].get("parent_node_id")
     whole = str(unit.get('final_decoded_value') or unit.get('url_decoded_value') or '')
 
     class Number(str):
@@ -618,7 +727,7 @@ def injected_sections(unit, analysis):
                     return
             yield path, str(value)
 
-    for node in nodes:
+    for node in sorted(nodes, key=lambda n: (n.get('transform') != 'json_leaf_extract', n['node_id'])):
         nid = node['node_id']
         if nid not in quotes:
             continue
@@ -642,10 +751,18 @@ def injected_sections(unit, analysis):
                         if any(q in value for q in quotes[nid])]
             if selected:
                 break
+        if not selected and nid in plain_ancestors:
+            continue
         if not selected and nid in errors:
             selected = [('', call) for call, _ in extract_error_channel(text, expressions=True)
                         if any(q in call for q in quotes[nid])]
         if not selected:
+            try:
+                parsed = json.loads(text)
+            except (ValueError, TypeError, RecursionError):
+                parsed = None
+            if isinstance(parsed, (dict, list)) or nid in plain_ancestors:
+                continue
             first = min(i for q in quotes[nid] for i in _positions(text, q))
             breakout = next((i for i, ch in enumerate(text[:first + 1])
                              if ch in "'\"`;|&$()<>{}"), None)
@@ -656,11 +773,11 @@ def injected_sections(unit, analysis):
                 while start < len(text) and text[start].isspace():
                     start += 1
             section = text[start:]
-            if section.strip() == text.strip():
+            if section.strip().strip("[]{}") == text.strip().strip("[]{}"):
                 continue
             selected = [('', section)]
         for path, value in selected:
-            if nid in errors:
+            if nid in errors and not path:
                 calls = extract_error_channel(value, expressions=True)
                 if calls:
                     value = '\n\n'.join(dict.fromkeys(call for call, _ in calls))
@@ -745,9 +862,9 @@ def build_model(report, ioc_top=40, intel=None):
         value = str(unit.get('final_decoded_value') or unit.get('url_decoded_value') or '')
         error_calls = extract_error_channel(value, expressions=True) if cat == 'sqli' else []
         lane = lane_of(cat, lane_rules)
-        if error_calls:
-            lane = LANES['sqli'][3]
         phase = phase_of(cat, lane, eff_rules, analysis, value, error_calls)
+        if cat == 'sqli' and phase in ('enumeration', 'extraction'):
+            lane = LANES['sqli'][2 if phase == 'enumeration' else 3]
         for occ in occs:
             tg = occ.get('target') or {}
             act = occ.get('activity') or {}
@@ -963,7 +1080,7 @@ def analyse_campaign(cid, us):
         if cat == 'sqli':
             if u['_error_calls']:
                 error_rows.append([cid, ts, u['count'], ', '.join(u['statuses']),
-                                   *error_channel_details(text, u['_error_calls']), [u['id']]])
+                                   *error_channel_details(text, u['_error_calls']), u['phase'], [u['id']]])
             hint = _HINT_NAMES.get(str(a.get('dbms_hint') or '').lower())
             seen = set()
             if hint:
@@ -1024,7 +1141,7 @@ def analyse_campaign(cid, us):
                 m = re.match(r'^([a-zA-Z][a-zA-Z0-9+.-]*)://(?:[^/@]*@)?(\[[^\]]+\]|[^/:?#]+)(?::(\d+))?', url)
                 scheme, host, port = (m.group(1).lower(), m.group(2), m.group(3) or '') if m else ('', '', '')
                 _bump(ssrf, (u['param'], clip(url, MAX_VALUE), host, port, scheme), ts, uid=u['id'])
-    error_rows.sort(key=lambda r: (r[0], r[1], r[5], r[8][0]))
+    error_rows.sort(key=lambda r: (r[0], r[1], r[5], r[-1][0]))
     omitted = {}
     out = {
         'error_channel': error_rows,
@@ -1285,6 +1402,7 @@ input[type=search],select{padding:4px 6px;background:var(--panel);color:var(--fg
 table.kv th{text-align:left;width:14em;vertical-align:top}table.kv td{white-space:pre-wrap;word-break:break-word}.det{margin:6px 0 14px}
 pre,code{font-family:Consolas,monospace}pre{white-space:pre-wrap;word-break:break-all;background:var(--pre);padding:8px;border-radius:4px;max-height:300px;overflow:auto;font-size:12px}
 span.tag{display:inline-block;padding:0 6px;border-radius:9px;font-size:11px;color:#fff !important;margin:1px;line-height:17px}
+span.tag.phase-extraction{color:#10241a !important}
 span.tag.inf{background:#455a64}.chip{font-size:12px;color:var(--chip)}.chip a{color:var(--chip)}
 .muted{color:var(--muted);font-size:12px}svg text{font:11px Segoe UI,Arial,sans-serif;fill:var(--fg)}svg text.gl{fill:#e8edf5}
 #tip{position:fixed;pointer-events:none;background:#1d2433;color:#fff;padding:4px 8px;font-size:12px;border-radius:4px;display:none;max-width:520px;word-break:break-all;white-space:pre-wrap;z-index:9}
@@ -1336,8 +1454,8 @@ const isoS=s=>s?new Date(s*1000).toISOString().replace('T',' ').slice(0,19):'';
 const tname=r=>D.tech_names[r]||r;
 const IN=D.intel||null;const ipi=ip=>{const x=IN&&IN[ip];if(!x)return '';if(x.error)return ' [AbuseIPDB: '+x.error+']';return ' ['+(x.infra||'unknown')+(x.isp?' ('+x.isp+')':'')+', '+(x.country||'?')+', AbuseIPDB score '+x.score+', '+fmt(x.reports||0)+' reports]';};
 const ipl=a=>a.map(ip=>ip+ipi(ip)).join(', ');const ring=s=>s==null?null:s>=75?'#d32f2f':s>=25?'#fb8c00':s>0?'#fdd835':'#9e9e9e';
-const PH={probing:'#b8860b',exploitation:'#c62828'};const PHL={probing:'probing',exploitation:'exploitation attempt'};
-function phTag(p){return el('span',{class:'tag',style:'background:'+PH[p]},PHL[p]||p);}
+const PH={probing:'#b8860b',enumeration:'#3554a5',extraction:'#1baf7a',exploitation:'#c62828'};const PHL={probing:'probing',enumeration:'enumeration',extraction:'extraction',exploitation:'exploitation attempt'};
+function phTag(p){return el('span',{class:'tag phase-'+p,style:'background:'+PH[p]},PHL[p]||p);}
 function tag(c){return el('span',{class:'tag',style:'background:'+(C[c]||'#555')},D.labels[c]||c);}
 function infTag(){return el('span',{class:'tag inf'},'related payload (inferred)');}
 const LANEC=(()=>{const m={};for(const c of CATS){const ls=D.lanes[c]||[];ls.forEach((l,i)=>{m[c+'|'+l]=C[c];});}return m;})();
@@ -1382,9 +1500,11 @@ const tot=CATS.reduce((a,c)=>a+s.units[c],0),req=CATS.reduce((a,c)=>a+s.requests
 const k=el('div',{class:'kpis'});const add=(v,l,t)=>k.appendChild(el('div',{class:'kpi'},t||null,el('b',null,v),el('span',{class:'lbl'},l)));
 add(fmt(tot),'attack payloads');add(fmt(req),'attack requests');for(const c of CATS)add(fmt(s.units[c]),'payloads',tag(c));
 add(fmt(s.endpoints),'targeted endpoints');add(fmt(s.sites.length),'sites');add(fmt(s.campaigns),'campaigns');add(fmt(s.unrelated),'unrelated actions');
+for(const p of ['probing','enumeration','extraction'])add(fmt(D.units.filter(u=>u.cat==='sqli'&&u.phase===p).length),'SQL payloads: '+p,phTag(p));
 box.appendChild(k);
 const p=[];p.push('Between '+(s.first||'n/a')+' and '+(s.last||'n/a')+', '+fmt(req)+' web requests carried '+fmt(tot)+' distinct payloads identified as attack attempts. ');
 p.push('They targeted '+fmt(s.endpoints)+' endpoint(s) ('+fmt(s.params)+' parameter(s)) on '+fmt(s.sites.length)+' site(s): '+s.sites.join(', ')+', grouped into '+fmt(s.campaigns)+' campaign(s). ');
+p.push('SQL payload phases: '+['probing','enumeration','extraction'].map(p=>p+' '+fmt(D.units.filter(u=>u.cat==='sqli'&&u.phase===p).length)).join('; ')+'. ');
 p.push('By category: '+CATS.map(c=>D.labels[c]+' '+fmt(s.units[c])+' payloads in '+fmt(s.requests[c])+' requests').join('; ')+'. ');
 if(D.evo.error_channel.length)p.push(fmt(D.evo.error_channel.length)+' error-channel extraction payload(s) were submitted; outcomes are not established. ');
 if(s.related)p.push(fmt(s.related)+' of these payloads are related payloads, inferred from neighbouring identified payloads on the same parameter. ');
@@ -1417,10 +1537,10 @@ const srcTot=new Map();for(const e of EV)srcTot.set(e[5],(srcTot.get(e[5])||0)+e
 const topSrc=[...srcTot].sort((a,b)=>b[1]-a[1]||(a[0]<b[0]?-1:1)).slice(0,8).map(x=>x[0]);const OTHER='other sources';
 const srcKeys=srcTot.size>topSrc.length?[...topSrc,OTHER]:topSrc;const SC=Object.fromEntries(srcKeys.map((k,i)=>[k,SRCPAL[i%SRCPAL.length]]));
 const srcLabel=x=>x===OTHER?x:x+(IN&&IN[x]&&IN[x].score!=null?' ('+(IN[x].infra||'unknown')+', abuse score '+IN[x].score+')':'');
-const by=el('select',null,el('option',{value:'cat'},'category'),el('option',{value:'phase'},'probing / exploitation'),el('option',{value:'src'},'source IP'));
+const by=el('select',null,el('option',{value:'cat'},'category'),el('option',{value:'phase'},'payload phase'),el('option',{value:'src'},'source IP'));
 host.appendChild(el('div',{class:'ctl'},'Colour attack requests by ',by));const legend=el('div',{class:'legend'});host.appendChild(legend);
 const s=sv('svg',{viewBox:'0 0 '+W+' '+H,width:'100%'});const pw=(W-L-10)/NB;host.appendChild(s);
-function drawHist(){const src=by.value==='src',ph=by.value==='phase';const keys=src?srcKeys:ph?['probing','exploitation']:CATS;const col=src?SC:ph?PH:C;const lab=src?srcLabel:ph?(c=>PHL[c]):(c=>D.labels[c]);
+function drawHist(){const src=by.value==='src',ph=by.value==='phase';const keys=src?srcKeys:ph?Object.keys(PH):CATS;const col=src?SC:ph?PH:C;const lab=src?srcLabel:ph?(c=>PHL[c]):(c=>D.labels[c]);
 const bins=Array.from({length:NB},()=>Object.fromEntries(keys.map(c=>[c,0])));
 for(const e of ev){const k=src?(SC[e[5]]&&e[5]!==OTHER?e[5]:OTHER):ph?e[6]:e[1];bins[Math.min(NB-1,Math.floor((e[0]-t0)/bw))][k]+=e[4];}
 let mx=1;bins.forEach(b=>mx=Math.max(mx,keys.reduce((a,c)=>a+b[c],0)));s.replaceChildren();
@@ -1444,8 +1564,8 @@ for(const e of ev){if(!row.has(e[k]))continue;const bi=Math.max(0,Math.min(NB-1,
 keys.forEach((x,i)=>{const t=sv('text',{x:LL-6,y:i*RH+13,'text-anchor':'end'});const lbl=k===2?tname(x):k===5?srcLabel(x):x;t.textContent=lbl.length>48?lbl.slice(0,47)+'\u2026':lbl;
 hover(t,()=>lbl+' ('+x+'): '+fmt(tot.get(x))+' requests');g.appendChild(t);g.appendChild(sv('line',{x1:LL,x2:W-10,y1:i*RH+RH,y2:i*RH+RH,stroke:'var(--line2)'}));});
 const cw=(W-10-LL)/NB;const php=by.value==='phase';for(const c of cells.values()){const top=CATS.reduce((a,b)=>(c.cat[b]||0)>(c.cat[a]||0)?b:a,CATS[0]);
-const r=sv('circle',{cx:LL+(c.b+.5)*cw,cy:c.r*RH+9,r:Math.min(8,2+Math.log2(1+c.n)),fill:php?(c.ph.exploitation?PH.exploitation:PH.probing):C[top],'fill-opacity':.8});
-hover(r,()=>iso(ea+c.b*ebw)+': '+fmt(c.n)+' requests ('+fmt(c.ph.probing||0)+' probing, '+fmt(c.ph.exploitation||0)+' exploitation attempt)');g.appendChild(r);}
+const r=sv('circle',{cx:LL+(c.b+.5)*cw,cy:c.r*RH+9,r:Math.min(8,2+Math.log2(1+c.n)),fill:php?PH[Object.keys(PH).reduce((a,b)=>(c.ph[b]||0)>(c.ph[a]||0)?b:a,'probing')]:C[top],'fill-opacity':.8});
+hover(r,()=>iso(ea+c.b*ebw)+': '+fmt(c.n)+' requests ('+Object.keys(PH).map(p=>fmt(c.ph[p]||0)+' '+PHL[p]).join(', ')+')');g.appendChild(r);}
 for(let i=0;i<=4;i++){const x=LL+(W-10-LL)*i/4;const t=sv('text',{x:x,y:HH-6,'text-anchor':'middle'});t.textContent=iso(ea+(eb-ea)*i/4).slice(5);g.appendChild(t);}
 lane.replaceChildren(g);}
 mode.addEventListener('change',drawLanes);drawLanes();
@@ -1497,7 +1617,7 @@ d.appendChild(g);
 const f=k=>E[k].filter(r=>r[0]===c.id);const sec=(h,heads,rows,s)=>{if(rows.length){d.appendChild(el('h4',null,h));simple(d,heads,rows,s||0);}};
 sec('DBMS fingerprint',['DBMS','Payloads','First','Last','Markers'],f('dbms').map(r=>[r[1],r[2],isoS(r[3]),isoS(r[4]),r[5],r[6]]));
 sec('Database objects',['Kind','Name','First','Last','Payloads'],f('objects').map(r=>[r[1],r[2],isoS(r[3]),isoS(r[4]),r[5],r[6]]),2);
-sec('Error-channel extraction',['First seen (UTC)','Requests','Statuses','Error expression','Submitted subquery','Table / view','Row selector'],f('error_channel').map(r=>[isoS(r[1]),r[2],r[3],r[4],r[5],r[6],r[7],r[8]]));
+sec('Error-channel extraction',['First seen (UTC)','Requests','Statuses','Error expression','Submitted expression','Table / view','Row selector','Kind'],f('error_channel').map(r=>[isoS(r[1]),r[2],r[3],r[4],r[5],r[6],r[7],r[8],r[9]]));
 sec('Values read by blind inference',VH.slice(1),f('strings').map(r=>vrow(r).slice(1)),6);
 sec('Commands and expressions',['Command / expression','Family','First','Last','Payloads'],f('commands').map(r=>[r[1],r[2],isoS(r[3]),isoS(r[4]),r[5],r[6]]),2);
 sec('External references',['Kind','Value','First','Last','Payloads'],f('callbacks').map(r=>[r[1],r[2],isoS(r[3]),isoS(r[4]),r[5],r[6]]),2);
@@ -1510,15 +1630,15 @@ d.appendChild(el('h4',null,'Example payloads per stage'));for(const l of lanes){
 // ---- per-category and per-target aggregates
 (function(){const host=document.getElementById('agg');const g=new Map();
 for(const u of D.units){const key=[u.cat,u.site,u.path,u.param,u.rules.join(' ')].join('\u0001');let a=g.get(key);
-if(!a){a={cat:u.cat,site:u.site,path:u.path,param:u.param,rules:u.rules,first:u.first,last:u.last,n:0,count:0,probing:0,exploitation:0};g.set(key,a);}
+if(!a){a={cat:u.cat,site:u.site,path:u.path,param:u.param,rules:u.rules,first:u.first,last:u.last,n:0,count:0,probing:0,enumeration:0,extraction:0,exploitation:0};g.set(key,a);}
 a.n++;a[u.phase]++;a.count+=u.count;if(u.first&&u.first<a.first)a.first=u.first;if(u.last>a.last)a.last=u.last;}
 const kp=el('div',{class:'kpis'});for(const c of CATS){const rs=D.units.filter(u=>u.cat===c);const rc=new Map();rs.forEach(u=>u.rules.forEach(r=>rc.set(r,(rc.get(r)||0)+1)));
 const top=[...rc].sort((a,b)=>b[1]-a[1]||(a[0]<b[0]?-1:1)).slice(0,6);kp.appendChild(el('div',{class:'kpi'},tag(c),el('b',null,fmt(rs.length)+' payloads'),
-el('span',{class:'lbl'},new Set(rs.map(u=>u.site+u.path)).size+' endpoints'),el('div',null,phTag('probing'),' '+fmt(rs.filter(u=>u.phase==='probing').length)+' ',phTag('exploitation'),' '+fmt(rs.filter(u=>u.phase==='exploitation').length)),el('ul',{class:'muted'},...top.map(t=>el('li',null,tname(t[0])+' ('+t[1]+')')))));}
-host.appendChild(kp);host.appendChild(el('p',{class:'muted'},'Phase, from the payload content only (it says nothing about the outcome): ',phTag('probing'),' tests whether the injection point reacts (syntax, boolean or time checks, version / user / schema fingerprinting, canary files such as the account database, script markers, callbacks); ',phTag('exploitation'),' tries to read stored data from application tables or non-canary files, run non-diagnostic commands, download or write files, take browser data or reach cloud metadata services.'));
+el('span',{class:'lbl'},new Set(rs.map(u=>u.site+u.path)).size+' endpoints'),el('div',null,phTag('probing'),' '+fmt(rs.filter(u=>u.phase==='probing').length)+' ',...(c==='sqli'?['enumeration','extraction']:['exploitation']).flatMap(p=>[phTag(p),' '+fmt(rs.filter(u=>u.phase===p).length)+' '])),el('ul',{class:'muted'},...top.map(t=>el('li',null,tname(t[0])+' ('+t[1]+')')))));}
+host.appendChild(kp);host.appendChild(el('p',{class:'muted'},'Phase, from the payload content only (it says nothing about the outcome): ',phTag('probing'),' tests whether the injection point reacts (syntax, boolean or time checks, canary files such as the account database, script markers, callbacks); ',phTag('enumeration'),' maps database structure, environment, row counts or value sizes; ',phTag('extraction'),' reads stored values from application tables; ',phTag('exploitation'),' tries to read non-canary files, run non-diagnostic commands, download or write files, take browser data or reach cloud metadata services.'));
 host.appendChild(el('h3',null,'Per target and technique'));
 table(host,[['Category',r=>r.cat,r=>tag(r.cat)],['Site',r=>r.site],['Path',r=>r.path],['Parameter',r=>r.param],['Technique / rule',r=>r.rules.map(tname).join('; ')],
-['First seen',r=>r.first],['Last seen',r=>r.last],['Payloads',r=>r.n],['Probing',r=>r.probing],['Exploitation attempts',r=>r.exploitation],['Requests',r=>r.count]],[...g.values()],{sort:7,dir:-1,catFilter:true});
+['First seen',r=>r.first],['Last seen',r=>r.last],['Payloads',r=>r.n],['Probing',r=>r.probing],['Enumeration',r=>r.enumeration],['Extraction',r=>r.extraction],['Exploitation attempts',r=>r.exploitation],['Requests',r=>r.count]],[...g.values()],{sort:7,dir:-1,catFilter:true});
 if(IN){host.appendChild(el('h3',null,'IP intelligence (AbuseIPDB, cached lookup)'));const req=new Map();for(const u of D.units)for(const ip of u.ips)req.set(ip,(req.get(ip)||0)+u.count);
 const rows=Object.keys(IN).sort().map(ip=>Object.assign({ip:ip,req:req.get(ip)||0},IN[ip]));const t=el('div');host.appendChild(t);
 table(t,[['IP',r=>r.ip],['Infrastructure',r=>r.error?'':(r.infra||'unknown'),r=>r.error?'':(r.infra||'unknown')+(D.infra_note&&D.infra_note[r.infra||'unknown']?' \u2014 '+D.infra_note[r.infra||'unknown']:'')],['Role',r=>r.roles.join(', ')],['Attack requests',r=>r.req],['Score',r=>r.error?-1:r.score,r=>r.error?'error: '+r.error:String(r.score)],['Country',r=>r.country||''],['ISP',r=>r.isp||''],

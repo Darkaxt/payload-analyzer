@@ -41,10 +41,10 @@ class ErrorChannelTests(unittest.TestCase):
                 analyzer.validate(result, nodes)
                 self.assertIn('sqli.error_based', result['rule_ids'])
                 self.assertTrue(report.extract_error_channel(value))
-                self.assertEqual(report.phase_of('sqli', '', result['rule_ids'], result, value), 'exploitation')
+                self.assertEqual(report.phase_of('sqli', '', result['rule_ids'], result, value), 'extraction')
 
     def test_probes_and_exact_subqueries(self):
-        for text in [SN + '(1,1)', '1/0', '(SELECT COUNT(*) FROM ALL_' + 'TABLES)>0']:
+        for text in [SN + '(1,1)', '1/0']:
             self.assertFalse(report.extract_error_channel(text))
             self.assertEqual(report.phase_of('sqli', '', [], {}, text), 'probing')
         self.assertFalse(report.extract_error_channel(SN + "(1,'(SELECT sample_value FROM synthetic_rows)')"))
@@ -52,9 +52,9 @@ class ErrorChannelTests(unittest.TestCase):
         for value in ["1' AND 1=" + SN + '(1,(' + q + '))--',
                       "1' AND 1=" + SN + '(1,(' + q + ")) AND 'a'='a"]:
             self.assertEqual(report.extract_error_channel(value), [(SN, [q])])
-            self.assertEqual(report.phase_of('sqli', '', [], {}, value), 'exploitation')
+            self.assertEqual(report.phase_of('sqli', '', [], {}, value), 'enumeration')
         self.assertEqual(report.phase_of('sqli', 'x', [], {}, "1' AND (SELECT PASS FROM USERS WHERE ID=1)='a"),
-                         'exploitation')
+                         'extraction')
         query = 'SELECT /* synthetic */ sample_value\n FROM synthetic_rows WHERE item_key=3'
         self.assertEqual(report.extract_error_channel(SN + '(1,(' + query + '))'), [(SN, [query])])
         self.assertFalse(report.extract_error_channel('CAST((SELECT sample_value FROM synthetic_rows) AS text)'))
@@ -74,14 +74,14 @@ class ErrorChannelTests(unittest.TestCase):
             model = report.build_model({'units': units})
             self.assertEqual(parse.call_count, len(units))
         rows = model['evo']['error_channel']
-        self.assertEqual([r[8] for r in rows], [['1'], ['0']])
+        self.assertEqual([r[9] for r in rows], [['1'], ['0']])
         self.assertEqual(rows[1][2:4], [2, '500'])
         self.assertEqual(rows[1][5], long_query)
         self.assertIn('ALL_' + 'TABLES', rows[1][6])
         self.assertIn('R=3', rows[1][7])
         for u in model['units']:
             if u['id'] != '2':
-                self.assertEqual((u['lane'], u['phase']), ('data extraction / inference', 'exploitation'))
+                self.assertEqual((u['lane'], u['phase']), ('metadata enumeration', 'enumeration'))
             else:
                 self.assertEqual(u['phase'], 'probing')
         self.assertEqual(model, report.build_model({'units': list(reversed(units))}))
@@ -89,7 +89,7 @@ class ErrorChannelTests(unittest.TestCase):
         for u in units:
             u['occurrences'][0]['activity']['first_seen'] = '2026-01-01 10:00:00 UTC'
         tied = report.build_model({'units': units})['evo']['error_channel']
-        self.assertEqual(tied, sorted(tied, key=lambda r: (r[0], r[1], r[5], r[8][0])))
+        self.assertEqual(tied, sorted(tied, key=lambda r: (r[0], r[1], r[5], r[9][0])))
 
     def test_focus_javascript(self):
         node = shutil.which('node')
@@ -102,6 +102,6 @@ class ErrorChannelTests(unittest.TestCase):
         result = subprocess.run([node, '-e', script], check=True, capture_output=True, text=True)
         rows = json.loads(result.stdout)
         self.assertEqual(len(rows), 1)
-        self.assertEqual((rows[0][2], rows[0][8]), (2, ['1']))
+        self.assertEqual((rows[0][2], rows[0][9]), (2, ['1']))
         self.assertIn('Error-channel extraction', report.JS)
         self.assertIn('error-channel extraction payload(s) were submitted', report.JS)

@@ -33,6 +33,7 @@ class InjectedSectionTests(unittest.TestCase):
                          '[0].onStatisticField: ' + expression)
         value['analysis']['techniques'][0]['evidence'].extend(
             [{'node_id': 0, 'quote': '314'}, {'node_id': 0, 'quote': 'SELECT synthetic_value'}])
+        sections[0]['layer'] = 'original -> json_leaf_extract'
         self.assertEqual(report.injected_sections(value, value['analysis']), sections)
 
     def test_breakout_scope_omission_and_layer(self):

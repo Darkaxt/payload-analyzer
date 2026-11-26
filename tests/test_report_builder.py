@@ -138,7 +138,7 @@ class ModelTest(unittest.TestCase):
         sq = [c for c in m['campaigns'] if 'sqli' in c['cats']][0]
         self.assertTrue(any('SQL injection stages' in t for t in sq['narrative']))
         lanes = {u['lane'] for u in m['units'] if u['cat'] == 'sqli'}
-        self.assertEqual(lanes, {'syntax / boolean probing', 'metadata enumeration', 'data extraction / inference'})
+        self.assertEqual(lanes, {'syntax / boolean probing', 'metadata enumeration'})
 
 
 class HtmlTest(unittest.TestCase):
@@ -198,10 +198,10 @@ class PhaseAndDetailTest(unittest.TestCase):
 
     def test_sqli_phase(self):
         self.assertEqual(self.phase('sqli', '', '1 AND 1=1'), 'probing')
-        self.assertEqual(self.phase('sqli', '', blind(80)), 'probing')  # dictionary view: enumeration
+        self.assertEqual(self.phase('sqli', '', blind(80)), 'enumeration')  # dictionary view: enumeration
         self.assertEqual(self.phase('sqli', '', '1 UNION ' + 'SELECT NULL ' + KW_FROM + ' DUAL'), 'probing')
         self.assertEqual(self.phase('sqli', '', '1 AND AS' + 'CII(SUB' + 'STR((SELECT token ' + KW_FROM
-                                    + ' app.accounts WHERE id=1),1,1))>64'), 'exploitation')
+                                    + ' app.accounts WHERE id=1),1,1))>64'), 'extraction')
 
     def test_other_phases(self):
         seg = lambda p: [{'program': p, 'arguments': []}]
@@ -228,7 +228,7 @@ class PhaseAndDetailTest(unittest.TestCase):
         self.assertEqual(len(inf[12]), inf[4])  # one comparison per payload
         self.assertEqual(len(inf[13]), inf[4])  # payload ids behind the row
         self.assertTrue(all(isinstance(r[-1], list) and r[-1] for r in m['evo']['objects']))
-        self.assertEqual({u['phase'] for u in m['units']}, {'probing', 'exploitation'})
+        self.assertEqual({u['phase'] for u in m['units']}, {'probing', 'enumeration', 'exploitation'})
         self.assertTrue(all(len(e) == 8 and e[4] == sum(n for _, n in e[7]) for e in m['events']))
 
     def test_probe_refinements(self):
@@ -240,7 +240,7 @@ class PhaseAndDetailTest(unittest.TestCase):
         exists = '1 AND (SELECT COUNT(*) ' + KW_FROM + ' APP.NODES)>0'
         self.assertEqual(self.phase('sqli', '', exists), 'probing')
         self.assertEqual(self.phase('sqli', '', '1 AND 1=(SELECT 1 ' + KW_FROM + ' APP.NODES WHERE rownum=1)'), 'probing')
-        self.assertEqual(self.phase('sqli', '', '1 AND 1=(SELECT name ' + KW_FROM + ' APP.NODES WHERE rownum=1)'), 'exploitation')
+        self.assertEqual(self.phase('sqli', '', '1 AND 1=(SELECT name ' + KW_FROM + ' APP.NODES WHERE rownum=1)'), 'extraction')
         self.assertEqual(self.phase('file_access', '', '../../../../etc'), 'probing')
         self.assertEqual(report_builder.inference_target("'MARK'"), 'environment fingerprint')
 
