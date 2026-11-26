@@ -371,7 +371,7 @@ def _sql_mask(text):
     return re.sub(r"--[^\r\n]*|/\*.*?\*/", lambda m: ' ' * len(m.group()), text, flags=re.S)
 
 
-def extract_error_channel(text, expressions=False):
+def extract_error_channel(text, expressions=False, include_constants=False):
     """Return error functions and submitted nonconstant expressions, not observed results."""
     if not _ERROR_CHANNEL.search(text):
         return []
@@ -402,7 +402,7 @@ def extract_error_channel(text, expressions=False):
                 constant = re.sub(r"'(?:''|[^'])*'|\bNULL\b|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", '', expr, flags=re.I)
                 if re.search(r'[A-Za-z_$\"]', constant):
                     submitted.append(expr)
-        if submitted:
+        if submitted or include_constants:
             found.append((text[call.start():end] if expressions else name, submitted))
     return found
 
@@ -543,6 +543,41 @@ def _size_measurement(expr):
         for arg in args[1:])
 
 
+def _error_size(expr):
+    """Only a returned count or size is exempt from error-based extraction."""
+    expr = _strip_parens(_sql_mask(expr))
+    if re.match(r'SELECT\s+', expr, re.I):
+        expr = re.sub(r'^SELECT\s+', '', expr, flags=re.I)
+        # Find the outer FROM, not one inside a scalar subquery.
+        for match in re.finditer(r'\bFROM\b', expr, re.I):
+            if _balanced('(' + expr[:match.start()] + ')', 0) == len(expr[:match.start()]) + 2:
+                expr = expr[:match.start()].strip()
+                break
+    expr = _strip_parens(expr)
+    match = re.match(r'(COUNT|LENGTH|MAX|MIN|NVL)\s*\(', expr, re.I)
+    if not match or _balanced(expr, match.end() - 1) != len(expr):
+        return False
+    args = _split_args(expr[match.end():-1])
+    name = match.group(1).upper()
+    if name in ('COUNT', 'LENGTH'):
+        return len(args) == 1 and bool(args[0])
+    if name in ('MAX', 'MIN'):
+        return len(args) == 1 and bool(re.match(r'^LENGTH\s*\(', _strip_parens(args[0]), re.I)) and _error_size(args[0])
+    return len(args) == 2 and _error_size(args[0]) and (_error_size(args[1]) or bool(re.fullmatch(
+        r"NULL|[+-]?\d+(?:\.\d+)?|'(?:''|[^'])*'", args[1], re.I)))
+
+
+def _error_phase(expressions):
+    if not expressions:
+        return 'probing'
+    return 'enumeration' if all(_error_size(expr) for expr in expressions) else 'extraction'
+
+
+def _error_label(expressions):
+    phase = _error_phase(expressions)
+    return 'Error-based ' + ('probe' if phase == 'probing' else phase)
+
+
 def phase_of(cat, lane, rules, analysis, text, error_calls=None):
     """'probing' (tests whether the injection point reacts, fingerprints, enumerates) or 'exploitation'
     (tries to read stored data or non-canary files, run non-diagnostic commands, download/write files,
@@ -552,6 +587,8 @@ def phase_of(cat, lane, rules, analysis, text, error_calls=None):
     if cat == 'sqli':
         if error_calls is None:
             error_calls = extract_error_channel(text)
+        if any(_error_phase(expressions) == 'extraction' for _, expressions in error_calls):
+            return 'extraction'
         if _SQL_EXPLOIT.search(up):
             return 'extraction'
         phases = []
@@ -778,14 +815,43 @@ def injected_sections(unit, analysis):
             selected = [('', section)]
         for path, value in selected:
             if nid in errors and not path:
-                calls = extract_error_channel(value, expressions=True)
+                calls = extract_error_channel(value, expressions=True, include_constants=True)
                 if calls:
-                    value = '\n\n'.join(dict.fromkeys(call for call, _ in calls))
+                    for call, submitted in calls:
+                        if call not in seen:
+                            seen.add(call)
+                            result.append({'text': call, 'layer': layer, 'label': _error_label(submitted)})
+                    continue
             rendered = (path + ': ' if path else '') + value
             if rendered == whole or rendered in seen:
                 continue
             seen.add(rendered)
             result.append({'text': rendered, 'layer': layer})
+    sources = [(section['text'], section['layer']) for section in result]
+    for node in nodes or [{'node_id': 0, 'value': whole}]:
+        text = str(node.get('value') or '')
+        chain, visited, current = [], set(), node
+        while current is not None and current['node_id'] not in visited:
+            visited.add(current['node_id'])
+            chain.append(str(current.get('transform') or current['node_id']))
+            current = by_id.get(current.get('parent_node_id'))
+        layer = ' -> '.join(reversed(chain)) if node.get('parent_node_id') is not None else ''
+        try:
+            document = json.loads(text, parse_int=Number, parse_float=Number)
+        except (ValueError, TypeError, RecursionError):
+            document = None
+        if isinstance(document, (dict, list)):
+            sources.extend((value, layer) for _, value in leaves(document))
+        else:
+            sources.append((text, layer))
+    calls_seen = set()
+    for text, layer in sources:
+        for call, submitted in extract_error_channel(text, expressions=True, include_constants=True):
+            if call in calls_seen or call in seen:
+                continue
+            calls_seen.add(call)
+            result.append({'text': call, 'layer': layer,
+                           'label': _error_label(submitted)})
     return result
 
 
@@ -1476,7 +1542,7 @@ if(opts.onclick)tr.addEventListener('click',()=>{tb.querySelectorAll('tr.sel').f
 draw();const api={search(v){inp.value=v;q=String(v).toLowerCase();draw();return idx0();},filter(set,label){ext=set;chip.replaceChildren();if(set)chip.append('filter: '+label+' ',el('a',{href:'#',onclick:e=>{e.preventDefault();api.filter(null);}},'clear'));draw();}};return api;}
 const UIDX=new Map(D.units.map((u,i)=>[u.id,i]));
 // Rows may carry hidden extras after the visible columns: [payload ids] and an optional comparison sequence.
-function injected(host,sections){for(const section of sections||[]){host.appendChild(el('div',{class:'muted'},'Injected section'+(section.layer?' (layer: '+section.layer+')':'')));host.appendChild(el('pre',null,section.text));}}
+function injected(host,sections){for(const section of sections||[]){host.appendChild(el('div',{class:'muted'},(section.label||'Injected section')+(section.layer?' (layer: '+section.layer+')':'')));host.appendChild(el('pre',null,section.text));}}
 function rowDetail(det,heads,r){const ids=r[heads.length]||[],seq=r[heads.length+1],pos=r[heads.length+2];
 const kv=el('table',{class:'kv'},el('tbody',null,...heads.map((h,i)=>el('tr',null,el('th',null,h),el('td',null,String(r[i]==null?'':r[i]))))));
 det.replaceChildren(el('h4',null,'Selected entry'),kv);

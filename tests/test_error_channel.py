@@ -53,6 +53,33 @@ class ErrorChannelTests(unittest.TestCase):
                       "1' AND 1=" + SN + '(1,(' + q + ")) AND 'a'='a"]:
             self.assertEqual(report.extract_error_channel(value), [(SN, [q])])
             self.assertEqual(report.phase_of('sqli', '', [], {}, value), 'enumeration')
+        for expr in ['COUNT(*)', 'LENGTH(USER)', 'MAX(LENGTH(token))', 'MIN(LENGTH(token))',
+                     'NVL(MAX(LENGTH(token)),0)']:
+            for submitted in [expr, 'SELECT ' + expr + ' FROM synthetic_rows']:
+                self.assertEqual(report.phase_of('sqli', '', [], {}, SN + '(1,(' + submitted + '))'), 'enumeration')
+        for expr in ['USER', 'VERSION()', "SYS_CONTEXT('USERENV','HOST')", 'COUNT(*)+1',
+                     'MAX(token)', 'NVL(USER,0)', 'SELECT TABLE_NAME FROM ALL_TABLES']:
+            self.assertEqual(report.phase_of('sqli', '', [], {}, SN + '(1,(' + expr + '))'), 'extraction')
+        probe = report.injected_sections({'final_decoded_value': SN + '(1,1)'}, {})
+        self.assertEqual(probe, [{'text': SN + '(1,1)', 'layer': '', 'label': 'Error-based probe'}])
+        call = SN + '(1,((SELECT owner FROM SYS.All_Tab_Columns WHERE ROWNUM=1)))'
+        value = "0' AND 1=1/(SELECT COUNT(*) FROM dual WHERE 1=" + call + ") AND '1'='1"
+        evidence = {'techniques': [{'rule_id': 'sqli.error_based',
+                                   'evidence': [{'node_id': 0, 'quote': SN + '('}]}]}
+        section_unit = {'final_decoded_value': value, 'decoding_nodes': [{'node_id': 0, 'value': value}]}
+        self.assertEqual(report.injected_sections(section_unit, evidence),
+                         [{'text': call, 'layer': '', 'label': 'Error-based extraction'}])
+        count = SN + '(1,(SELECT COUNT(*) FROM APP.USERS))'
+        for text, expected in [(count, 'Error-based enumeration'), (SN + '(1,1)', 'Error-based probe')]:
+            section_unit['final_decoded_value'] = '1=' + text
+            section_unit['decoding_nodes'][0]['value'] = '1=' + text
+            self.assertEqual(report.injected_sections(section_unit, evidence),
+                             [{'text': text, 'layer': '', 'label': expected}])
+        section_unit['final_decoded_value'] = '1=' + call + ' AND 2=' + count
+        section_unit['decoding_nodes'][0]['value'] = section_unit['final_decoded_value']
+        self.assertEqual(report.injected_sections(section_unit, evidence),
+                         [{'text': call, 'layer': '', 'label': 'Error-based extraction'},
+                          {'text': count, 'layer': '', 'label': 'Error-based enumeration'}])
         self.assertEqual(report.phase_of('sqli', 'x', [], {}, "1' AND (SELECT PASS FROM USERS WHERE ID=1)='a"),
                          'extraction')
         query = 'SELECT /* synthetic */ sample_value\n FROM synthetic_rows WHERE item_key=3'
@@ -72,7 +99,7 @@ class ErrorChannelTests(unittest.TestCase):
                  for i, v in enumerate(values)]
         with mock.patch.object(report, 'extract_error_channel', wraps=report.extract_error_channel) as parse:
             model = report.build_model({'units': units})
-            self.assertEqual(parse.call_count, len(units))
+            self.assertEqual(parse.call_count, 2 * len(units))
         rows = model['evo']['error_channel']
         self.assertEqual([r[9] for r in rows], [['1'], ['0']])
         self.assertEqual(rows[1][2:4], [2, '500'])
@@ -80,7 +107,9 @@ class ErrorChannelTests(unittest.TestCase):
         self.assertIn('ALL_' + 'TABLES', rows[1][6])
         self.assertIn('R=3', rows[1][7])
         for u in model['units']:
-            if u['id'] != '2':
+            if u['id'] == '0':
+                self.assertEqual((u['lane'], u['phase']), ('data extraction / inference', 'extraction'))
+            elif u['id'] == '1':
                 self.assertEqual((u['lane'], u['phase']), ('metadata enumeration', 'enumeration'))
             else:
                 self.assertEqual(u['phase'], 'probing')

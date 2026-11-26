@@ -36,7 +36,7 @@ class DatabaseCodeTests(unittest.TestCase):
             with self.subTest(expr=expr):
                 calls = report.extract_error_channel(SN + '(1,(' + expr + '))')
                 self.assertIn(expr, calls[0][1])
-                self.assertEqual(report.phase_of('sqli', '', [], {}, expr, calls), 'enumeration')
+                self.assertEqual(report.phase_of('sqli', '', [], {}, expr, calls), 'extraction')
         for expr in ['1', "'marker'", 'NULL', '-1.25']:
             self.assertFalse(report.extract_error_channel(SN + '(1,' + expr + ')'))
         for cols in ['COUNT(PASSWORDHASH)', 'MAX(LENGTH(PASSWORDHASH))']:
@@ -60,15 +60,22 @@ class DatabaseCodeTests(unittest.TestCase):
 
     def test_json_sections(self):
         for expr, expected in [(A, ('rce', 'probing', 'command execution')),
-                               (B, ('sqli', 'enumeration', 'metadata enumeration')),
+                               (B, ('sqli', 'extraction', 'data extraction / inference')),
                                (SCHED, ('rce', 'exploitation', 'command execution'))]:
             result = row(expr)
             self.assertEqual((result['cat'], result['phase'], result['lane']), expected)
-            self.assertEqual(len(result['injected']), 1)
+            self.assertEqual(len(result['injected']), 4 if expr == B else 2)
             self.assertTrue(result['injected'][0]['text'].startswith('[0].ID: '))
+            self.assertEqual(result['injected'][1]['label'], 'Error-based extraction')
+        expr = "(SELECT CoNcAt(CoNcAt(CoNcAt(owner,'.'),table_name),':') FROM SYS.All_Tab_Columns WHERE (column_name LIKE '%PASS%' OR column_name LIKE '%TOKEN%') AND owner='U' AND ROWNUM=1)"
+        result = row(expr)
+        self.assertEqual((result['phase'], result['lane']), ('extraction', 'data extraction / inference'))
+        self.assertEqual(result['injected'][0]['text'], '[0].ID: ' + sample(expr))
+        self.assertEqual(result['injected'][1]['text'], SN + '(1,(' + expr + '))')
+        self.assertEqual(result['injected'][1]['label'], 'Error-based extraction')
 
     def test_sql_values_vs_structure(self):
-        cases = [(SN + '(1,(SELECT TABLE_NAME FROM ALL_TABLES WHERE R=3))', 'enumeration'),
+        cases = [(SN + '(1,(SELECT TABLE_NAME FROM ALL_TABLES WHERE R=3))', 'extraction'),
                  (SN + '(1,(SELECT EMAIL FROM APP.USERS WHERE ROWNUM=1))', 'extraction'),
                  ('ASCII(SUBSTR((SELECT PASSWORDHASH FROM APP.T WHERE ROWNUM=1),1,1))>64', 'extraction'),
                  ('ASCII(SUBSTR((SELECT TABLE_NAME FROM ALL_TABLES WHERE ROWNUM=1),1,1))>64', 'enumeration'),
