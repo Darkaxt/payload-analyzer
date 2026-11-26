@@ -1,4 +1,5 @@
 import sys
+import hashlib
 import unittest
 from pathlib import Path
 
@@ -9,7 +10,24 @@ import report_builder as r
 class SQLDecodeTests(unittest.TestCase):
     def test_sql_decode(self):
         xml = 'DBMS_' + 'XMLGEN.GETXML'
-        cases = [
+        digest = hashlib.md5(b'9').hexdigest()[:28]
+        examples = [
+            ("EXTRACTVALUE(1,CONCAT(CHAR(126),SUBSTRING(MD5(999999999),1,28)))",
+             "EXTRACTVALUE(1,'~" + hashlib.md5(b'999999999').hexdigest()[:28] + "')"),
+            ("convert(int,(select sys.fn_sqlvarbasetostr(HashBytes('MD5','127381'))))",
+             "convert(int,'0x" + hashlib.md5(b'127381').hexdigest() + "')"),
+            ('BENCH' + "MARK(1000,MD5('x'))", 'BENCH' + "MARK(1000,MD5('x'))"),
+            ('MD5(column_name)', 'MD5(column_name)'),
+            ("LENGTH('ART3X')>1024", '5>1024'),
+            ("IF((LENGTH(('ART3X'))>1024),id,-id)", 'IF((5>1024),id,-id)'),
+            ("IF((ORD(SUBSTRING(('ART3X'),2,1))>63),id,-id)", 'IF((82>63),id,-id)'),
+            ("UPPER((('x')))", "'X'"),
+            ('LENGTH((5))', '1'),
+            ('1+2*3', '7'),
+            ("SUBSTRING('abcdef' FROM 2 FOR 3)", "'bcd'"),
+            ("SHA2('x',256)", "'" + hashlib.sha256(b'x').hexdigest() + "'"),
+        ]
+        cases = examples + [
             ('(SELECT 1 FROM dual)', '1'),
             ("(SELECT 'x' FROM DUAL)", "'x'"),
             ('((SELECT COUNT(*) FROM dual WHERE C)>0)', 'C'),
@@ -21,7 +39,7 @@ class SQLDecodeTests(unittest.TestCase):
             ("syscs_util.syscs_get_database_property('derby.database.sqlAuthorization')",
              "syscs_util.syscs_get_database_property('derby.database.sqlAuthorization')"),
             ("SYS_CONTEXT/**/('USERENV','DB_NAME')", "SYS_CONTEXT('USERENV','DB_NAME')"),
-            ("SUBSTRING(MD5(9),1,28)||'x'", "SUBSTRING(MD5(9),1,28)||'x'"),
+            ("SUBSTRING(MD5(9),1,28)||'x'", "'" + digest + "x'"),
             ('username||CHR(58)||password', "username||':'||password"),
             ('CHR(0x3a)', "':'"), ('NCHAR(39)', "''''"),
             ("'a'||'b'", "'ab'"), ("'a'+'b'", "'ab'"),
@@ -41,8 +59,8 @@ class SQLDecodeTests(unittest.TestCase):
             ('NULL-- -', 'NULL-- -'),
             ('NULL# CHAR(58)', 'NULL# CHAR(58)'),
             ('NULL/* retained */', 'NULL/* retained */'),
-            ("EXTRACTVALUE(1,'~'||(SUBSTRING(MD5(9),1,28)))", "EXTRACTVALUE(1,'~'||SUBSTRING(MD5(9),1,28))"),
-            ("CONCAT('~',SUBSTRING(MD5(9),1,28))", "'~'||SUBSTRING(MD5(9),1,28)"),
+            ("EXTRACTVALUE(1,'~'||(SUBSTRING(MD5(9),1,28)))", "EXTRACTVALUE(1,'~" + digest + "')"),
+            ("CONCAT('~',SUBSTRING(MD5(9),1,28))", "'~" + digest + "'"),
             ('ASCII(SUBSTRING(x,3,1))>77', "ASCII(SUBSTRING(x,3,1))>77 /* 'M' */"),
             (xml + "('SELECT CHR(58) FROM dual')", xml + "('SELECT '':'' FROM dual')"),
             ("EXEC('SELECT CHAR(58)')", "EXEC('SELECT '':''')"),

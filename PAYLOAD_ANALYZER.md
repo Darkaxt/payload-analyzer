@@ -16,6 +16,8 @@ SQL phases distinguish probing (syntax, boolean, timing and capability checks, e
 
 SQL expressions are decoded (CHR/CHAR codes, concatenation, hex literals, SQL embedded in strings) for display and classification (1.9.6)
 
+Constant-only expressions (hashes, string functions, integer arithmetic) are resolved in the decoded form; time-delay arguments are kept verbatim (1.9.7).
+
 ## Recommended pipeline
 
 ```

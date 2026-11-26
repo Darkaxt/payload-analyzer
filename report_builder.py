@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import binascii
 import json
 import os
 import re
@@ -396,12 +398,106 @@ def _sql_changed(original, decoded):
             != ''.join(t for t in _sql_tokens(decoded) if not t.isspace()))
 
 
+_SQL_DELAY = {'SLE' + 'EP', 'BENCH' + 'MARK', 'PG_SLE' + 'EP', 'WAIT' + 'FOR',
+              'DBMS_' + 'PIPE', 'DBMS_' + 'LOCK'}
+
+
+def _sql_delay(name):
+    return any(part in _SQL_DELAY for part in name.upper().split('.'))
+
+
+def _sql_fold(name, args):
+    """Evaluate a deliberately small literal-only allowlist, never database code."""
+    if any(len(a) > 4096 for a in args):
+        return None
+    args = [_strip_parens(a) for a in args]
+    if name in ('FN_SQLVARBASETOSTR', 'FN_VARBINTOHEXSTR') and len(args) == 1:
+        call = re.fullmatch(r'HASHBYTES\s*\((.*)\)', args[0], re.I | re.S)
+        parts = [_strip_parens(a) for a in _split_args(call.group(1))] if call else []
+        if len(parts) != 2 or not all(_sql_literal(a) for a in parts):
+            return None
+        algorithm = {'MD5': 'md5', 'SHA1': 'sha1', 'SHA2_256': 'sha256',
+                     'SHA2_512': 'sha512'}.get(_sql_unquote(parts[0]).upper())
+        if not algorithm:
+            return None
+        encoding = 'utf-16le' if parts[1].startswith(('n', 'N')) else 'utf-8'
+        return _sql_quote('0x' + hashlib.new(algorithm, _sql_unquote(parts[1]).encode(encoding)).hexdigest())
+    values = []
+    for arg in args:
+        if _sql_literal(arg):
+            values.append(_sql_unquote(arg))
+        elif re.fullmatch(r'[+-]?\d{1,100}', arg):
+            values.append(str(int(arg)))
+        else:
+            return None
+    n = len(values)
+    value = None
+    if name in ('MD5', 'SHA', 'SHA1') and n == 1:
+        value = hashlib.new('md5' if name == 'MD5' else 'sha1', values[0].encode('utf-8')).hexdigest()
+    elif name == 'SHA2' and n == 2 and values[1] in ('224', '256', '384', '512'):
+        value = hashlib.new('sha' + values[1], values[0].encode('utf-8')).hexdigest()
+    elif name in ('UPPER', 'UCASE', 'LOWER', 'LCASE') and n == 1:
+        value = values[0].upper() if name in ('UPPER', 'UCASE') else values[0].lower()
+    elif name in ('SUBSTRING', 'SUBSTR', 'MID') and n in (2, 3):
+        start = int(values[1])
+        if start == 0 or (n == 3 and int(values[2]) < 0):
+            return None
+        start = start - 1 if start > 0 else max(0, len(values[0]) + start)
+        value = values[0][start:] if n == 2 else values[0][start:start + int(values[2])]
+    elif name in ('LEFT', 'RIGHT') and n == 2 and int(values[1]) >= 0:
+        width = int(values[1])
+        value = values[0][:width] if name == 'LEFT' else (values[0][-width:] if width else '')
+    elif name in ('LENGTH', 'LEN', 'CHAR_LENGTH') and n == 1:
+        return str(len(values[0].rstrip(' ') if name == 'LEN' else values[0]))
+    elif name in ('ASCII', 'ORD') and n == 1 and len(values[0]) == 1 and ord(values[0]) < 128:
+        return str(ord(values[0]))
+    elif name == 'REVERSE' and n == 1:
+        value = values[0][::-1]
+    elif name == 'REPLACE' and n == 3 and values[1]:
+        if len(values[0]) + values[0].count(values[1]) * max(0, len(values[2]) - len(values[1])) <= 4096:
+            value = values[0].replace(values[1], values[2])
+    elif name in ('TRIM', 'LTRIM', 'RTRIM') and n == 1:
+        value = getattr(values[0], {'TRIM': 'strip', 'LTRIM': 'lstrip', 'RTRIM': 'rstrip'}[name])(' ')
+    elif name == 'HEX' and n == 1:
+        value = binascii.hexlify(values[0].encode('utf-8')).decode('ascii').upper()
+    elif name == 'UNHEX' and n == 1:
+        raw = binascii.unhexlify(values[0])
+        if all(32 <= b <= 126 for b in raw):
+            value = raw.decode('ascii')
+    elif name == 'CONCAT' and n >= 2 and sum(map(len, values)) <= 4096:
+        value = ''.join(values)
+    return _sql_quote(value) if value is not None and len(value) <= 4096 else None
+
+
 def sql_decode(text):
     """Deterministic display-only SQL decoding; unknown syntax remains untouched."""
+    original = text
     try:
-        return _sql_annotate(_sql_simplify(_sql_decode(text, 0)))
-    except (ValueError, OverflowError, RecursionError, TypeError):
+        protected = []
+        masked = ''.join(' ' * len(t) if _sql_literal(t) or t.startswith(('--', '#', '/*')) else t
+                         for t in _sql_tokens(text))
+        for call in re.finditer(r'[\w.$]+\s*\(', masked):
+            if not _sql_delay(call.group().rstrip(' (')):
+                continue
+            end = _balanced(text, call.end() - 1)
+            if end > 0 and not any(a <= call.start() < b for a, b, _ in protected):
+                key = 'SQL_DELAY_OPAQUE_' + str(len(protected))
+                while key in original:
+                    key += '_'
+                protected.append((call.start(), end, key))
+        for start, end, key in reversed(protected):
+            text = text[:start] + key + text[end:]
+        for _ in range(32):
+            decoded = _sql_simplify(_sql_decode(text, 0))
+            if decoded == text:
+                break
+            text = decoded
+        text = _sql_annotate(text)
+        for start, end, key in protected:
+            text = text.replace(key, original[start:end])
         return text
+    except (ValueError, OverflowError, RecursionError, TypeError):
+        return original
 
 
 def _sql_decode(text, depth):
@@ -431,18 +527,63 @@ def _sql_decode(text, depth):
         while j < len(tokens) and tokens[j].isspace():
             j += 1
         name = token.upper()
+        if re.fullmatch(r'\d{1,100}', token):
+            end = i + 1
+            while end < len(tokens) and (tokens[end].isspace() or tokens[end] in ('+', '-', '*')
+                                         or re.fullmatch(r'\d{1,100}', tokens[end])):
+                end += 1
+            run = ''.join(tokens[i:end]).strip()
+            before = ''.join(tokens[:i]).rstrip()
+            after = ''.join(tokens[end:]).lstrip()
+            if (len(run) <= 4096 and re.fullmatch(r'\d+(?:\s*[+*-]\s*\d+)+', run)
+                    and not re.search(r'[\w.$@+*/-]$', before)
+                    and not re.match(r'[\w.$@+*/-]', after)):
+                terms = re.split(r'\s*([+*-])\s*', run)
+                sums, current, sign = [], int(terms[0]), 1
+                for op, operand in zip(terms[1::2], terms[2::2]):
+                    if op == '*':
+                        current *= int(operand)
+                    else:
+                        sums.append(sign * current)
+                        current, sign = int(operand), (1 if op == '+' else -1)
+                result = str(sum(sums) + sign * current)
+                if len(result) <= 4096:
+                    out.append(result + (' ' if tokens[end - 1].isspace() else ''))
+                    i = end
+                    continue
         if j < len(tokens) and tokens[j] == '(':
             level, k = 1, j + 1
             while k < len(tokens) and level:
                 level += (tokens[k] == '(') - (tokens[k] == ')')
                 k += 1
             if not level:
+                prefix = ''.join(tokens[:i])
+                qualified = re.search(r'([\w.$]+\.)$', prefix)
+                full_name = (qualified.group(1) if qualified else '') + name
+                if _sql_delay(full_name):
+                    out.append(''.join(tokens[i:k]))
+                    i = k
+                    continue
                 inner = _sql_decode(''.join(tokens[j + 1:k - 1]), depth + 1)
                 args = _split_args(inner)
+                # SQL's alternate substring syntax has literal FROM/FOR operands.
+                if name in ('SUBSTRING', 'SUBSTR', 'MID') and len(args) == 1:
+                    match = re.fullmatch(r"((?:[nN]?'(?:''|[^'])*'|[+-]?\d+))\s+FROM\s+([+-]?\d+)(?:\s+FOR\s+([+-]?\d+))?", inner, re.I)
+                    if match:
+                        args = [a for a in match.groups() if a is not None]
                 if name in ('CHR', 'CHAR', 'NCHR', 'NCHAR'):
                     args = _split_args(''.join(tokens[j + 1:k - 1]))
-                replacement = None
-                if name in ('CHR', 'CHAR', 'NCHR', 'NCHAR') and len(args) == 1 and re.fullmatch(r'(?:\d+|0[xX][0-9a-fA-F]+)', args[0]):
+                try:
+                    replacement = (_sql_fold(name, args) if not qualified or full_name.upper() in
+                                   ('SYS.FN_SQLVARBASETOSTR', 'MASTER.DBO.FN_VARBINTOHEXSTR') else None)
+                except (ValueError, OverflowError, UnicodeError):
+                    replacement = None
+                if replacement is not None:
+                    if qualified:
+                        remove = len(qualified.group(1))
+                        while remove:
+                            remove -= len(out.pop())
+                elif name in ('CHR', 'CHAR', 'NCHR', 'NCHAR') and len(args) == 1 and re.fullmatch(r'(?:\d+|0[xX][0-9a-fA-F]+)', args[0]):
                     number = int(args[0], 16 if args[0].lower().startswith('0x') else 10)
                     if 32 <= number <= 126:
                         replacement = _sql_quote(chr(number))
@@ -488,6 +629,19 @@ def _sql_decode(text, depth):
     out, i = [], 0
     while i < len(tokens):
         token = tokens[i]
+        if _sql_delay(token):
+            j = i + 1
+            while j < len(tokens) and tokens[j].isspace():
+                j += 1
+            if j < len(tokens) and tokens[j] == '(':
+                level, end = 1, j + 1
+                while end < len(tokens) and level:
+                    level += (tokens[end] == '(') - (tokens[end] == ')')
+                    end += 1
+                if not level:
+                    out.extend(tokens[i:end])
+                    i = end
+                    continue
         if _sql_literal(token):
             value, end = _sql_unquote(token), i + 1
             while True:
@@ -500,6 +654,8 @@ def _sql_decode(text, depth):
                 while k < len(tokens) and tokens[k].isspace():
                     k += 1
                 if k >= len(tokens) or not _sql_literal(tokens[k]):
+                    break
+                if len(value) + len(_sql_unquote(tokens[k])) > 4096:
                     break
                 value += _sql_unquote(tokens[k])
                 end = k + 1
@@ -536,6 +692,11 @@ def _sql_simplify(text, depth=0):
         while previous >= 0 and tokens[previous].isspace():
             previous -= 1
         is_call = previous >= 0 and bool(re.fullmatch(r'[\w.$]+', tokens[previous]))
+        call_name = re.search(r'([\w.$]+)\s*$', ''.join(tokens[:i]))
+        if call_name and _sql_delay(call_name.group(1)):
+            out.extend(tokens[i:end])
+            i = end
+            continue
         inner = _sql_simplify(''.join(tokens[i + 1:end - 1]), depth + 1).strip()
         constant = re.fullmatch(r'(?:SELECT\s+(' + literal + r')(?:\s+FROM\s+' + dummy + r')?|VALUES\s+(' + literal + r'))', inner, re.I)
         count = re.fullmatch(r'SELECT\s+COUNT\s*\(\s*\*\s*\)\s+FROM\s+' + dummy + r'(?:\s+WHERE\s+(.+))?', inner, re.I | re.S)
@@ -851,7 +1012,8 @@ def _error_constant(expr, depth=0):
             'MD5', 'HASHBYTES', 'SYS.FN_SQLVARBASETOSTR', 'ASCII', 'ORD', 'UNICODE',
             'LENGTH', 'LEN', 'CHAR_LENGTH', 'LOWER', 'UPPER', 'TRIM', 'LTRIM', 'RTRIM',
             'REPLACE', 'REVERSE', 'COALESCE', 'NVL', 'IFNULL', 'TO_CHAR', 'HEX', 'UNHEX',
-            'LEFT', 'RIGHT', 'REPEAT', 'SPACE', 'ABS'}
+            'LEFT', 'RIGHT', 'REPEAT', 'SPACE', 'ABS', 'SHA', 'SHA1', 'SHA2', 'UCASE', 'LCASE',
+            'MASTER.DBO.FN_VARBINTOHEXSTR'}
     return name in pure and bool(args) and all(_error_constant(arg, depth + 1) for arg in args)
 
 
