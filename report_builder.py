@@ -119,9 +119,9 @@ def short(uid):
     return uid.split('_', 1)[-1][:12] if uid else ''
 
 
-def clip(text, n):
-    text = ' '.join(str(text).split())
-    return text if len(text) <= n else text[:n - 1] + '\u2026'
+def clip(text, n=None):
+    """Whitespace-normalised display text. Never truncated (n is kept for call compatibility)."""
+    return ' '.join(str(text).split())
 
 
 # ---------------------------------------------------------------- IOC extraction
@@ -913,7 +913,7 @@ def build_model(report, ioc_top=40, intel=None):
         ph['rules'][e[2]] += e[4]
         ph['targets'].add(e[3])
     phases = [{'start': p['start'], 'end': p['end'] + 59, 'cats': dict(sorted(p['cats'].items())),
-               'rules': sorted(p['rules'].items(), key=lambda x: (-x[1], x[0]))[:5],
+               'rules': sorted(p['rules'].items(), key=lambda x: (-x[1], x[0])),
                'targets': len(p['targets'])} for p in phases]
 
     campaigns, evolution = build_evolution(rows)
@@ -938,7 +938,7 @@ def build_model(report, ioc_top=40, intel=None):
             'units': cat_counts, 'requests': req_counts,
             'related': sum(1 for r in rows if r['related']),
             'unrelated': sum(unrelated.values()), 'campaigns': len(campaigns),
-            'source_ips': [[ip, n] for ip, n in sorted(src_ips.items(), key=lambda x: (-x[1], x[0]))[:20]],
+            'source_ips': [[ip, n] for ip, n in sorted(src_ips.items(), key=lambda x: (-x[1], x[0]))],
             'source_ip_total': len(src_ips),
         },
         'phases': phases, 'units': rows, 'events': ev, 'crawl': related_crawling(activity),
@@ -993,14 +993,13 @@ def _merge_campaigns(rows):
     return [sorted(g['idx'], key=lambda i: (rows[i]['ts'], rows[i]['_line'], rows[i]['id'])) for g in groups]
 
 
-def _top(counter, n):
+def _top(counter, n=None):
     return [k for k, _ in sorted(counter.items(), key=lambda x: (-x[1], x[0]))[:n]]
 
 
-def _names(items, n=4):
-    items = list(items)
-    s = ', '.join(items[:n])
-    return s + (' and {} more'.format(len(items) - n) if len(items) > n else '')
+def _names(items, n=None):
+    """Every name, comma separated (n is kept for call compatibility)."""
+    return ', '.join(str(x) for x in items)
 
 
 def build_evolution(rows):
@@ -1087,7 +1086,7 @@ def analyse_campaign(cid, us):
                 seen.add(hint)
                 dbms_markers[hint]['analyzer hint'] += 1
             for name, rx in _DBMS:
-                for m in rx.findall(up)[:3]:
+                for m in rx.findall(up):
                     seen.add(name)
                     dbms_markers[name][clip(m, 30)] += 1
             for name in seen:
@@ -1146,7 +1145,7 @@ def analyse_campaign(cid, us):
     out = {
         'error_channel': error_rows,
         'dbms': _rows_out(cid, dbms, lambda k, v: [k, v['n'], v['first'], v['last'],
-                                                   ', '.join(_top(dbms_markers[k], 5))], omitted, 'dbms'),
+                                                   ', '.join(_top(dbms_markers[k]))], omitted, 'dbms'),
         'objects': _rows_out(cid, objects, lambda k, v: [k[0], k[1], v['first'], v['last'], v['n']], omitted, 'objects'),
         'commands': _rows_out(cid, cmds, lambda k, v: [k[0], k[1], v['first'], v['last'], v['n']], omitted, 'commands'),
         'callbacks': _rows_out(cid, cbs, lambda k, v: [k[0], k[1], v['first'], v['last'], v['n']], omitted, 'callbacks'),
@@ -1239,7 +1238,7 @@ def narrative(us, out, ips, params, paths, first, last):
     for u in us:
         if u['cat'] not in order:
             order.append(u['cat'])
-    for cat in order[:3]:
+    for cat in order:
         cu = [u for u in us if u['cat'] == cat]
         stages = []
         for u in cu:
@@ -1281,7 +1280,7 @@ def narrative(us, out, ips, params, paths, first, last):
         elif cat == 'xss':
             s.append('{} script injection vector(s) were sent to parameter(s) {}.'.format(
                 len(out['xss']), _names(sorted({r[1] for r in out['xss']}), 3)))
-    return s[:4]
+    return s
 
 
 def build_graph(rows, ioc_units, ioc_rules, ioc_targets, src_targets, ioc_top, max_src=20, max_targets=40):
@@ -1422,11 +1421,11 @@ D.events=D.events.map(e=>{const k=e[7].filter(x=>keep.has(x[0]));return k.length
 const fip=new Set(units.flatMap(u=>u.ips||[]));D.crawl=Object.assign({},D.crawl,{hours:D.crawl.hours.map(h=>{const i=h[2].map((ip,j)=>[ip,h[3][j]]).filter(x=>fip.has(x[0]));return i.length?[h[0],i.reduce((a,x)=>a+x[1],0),i.map(x=>x[0]),i.map(x=>x[1])]:null;}).filter(Boolean)});
 D.crawl.requests=D.crawl.hours.reduce((a,h)=>a+h[1],0);
 const ph=[];for(const e of D.events){let p=ph[ph.length-1];if(!p||e[0]-p.end>7200){p={start:e[0],end:e[0],cats:{},r:{},t:new Set()};ph.push(p);}p.end=e[0];p.cats[e[1]]=(p.cats[e[1]]||0)+e[4];p.r[e[2]]=(p.r[e[2]]||0)+e[4];p.t.add(e[3]);}
-D.phases=ph.map(p=>({start:p.start,end:p.end+59,cats:p.cats,rules:Object.entries(p.r).sort((a,b)=>b[1]-a[1]||(a[0]<b[0]?-1:1)).slice(0,5),targets:p.t.size}));
+D.phases=ph.map(p=>({start:p.start,end:p.end+59,cats:p.cats,rules:Object.entries(p.r).sort((a,b)=>b[1]-a[1]||(a[0]<b[0]?-1:1)),targets:p.t.size}));
 const s=D.scope,ips=new Set(units.flatMap(u=>u.ips||[]));
 s.units=Object.fromEntries(CK.map(c=>[c,units.filter(u=>u.cat===c).length]));s.requests=Object.fromEntries(CK.map(c=>[c,units.filter(u=>u.cat===c).reduce((a,u)=>a+u.count,0)]));
 s.sites=[...new Set(units.map(u=>u.site))].sort();s.endpoints=new Set(units.map(u=>u.site+'\u0001'+u.path)).size;s.params=new Set(units.map(u=>u.site+'\u0001'+u.path+'\u0001'+u.param)).size;
-s.related=units.filter(u=>u.related).length;s.source_ip_total=ips.size;const sc={};units.forEach(u=>(u.ips||[]).forEach(ip=>{sc[ip]=(sc[ip]||0)+u.count;}));s.source_ips=Object.entries(sc).sort((a,b)=>b[1]-a[1]||(a[0]<b[0]?-1:1)).slice(0,20);const fs=units.map(u=>u.first).filter(Boolean).sort(),ls=units.map(u=>u.last).filter(Boolean).sort();s.first=fs[0]||'';s.last=ls[ls.length-1]||'';
+s.related=units.filter(u=>u.related).length;s.source_ip_total=ips.size;const sc={};units.forEach(u=>(u.ips||[]).forEach(ip=>{sc[ip]=(sc[ip]||0)+u.count;}));s.source_ips=Object.entries(sc).sort((a,b)=>b[1]-a[1]||(a[0]<b[0]?-1:1));const fs=units.map(u=>u.first).filter(Boolean).sort(),ls=units.map(u=>u.last).filter(Boolean).sort();s.first=fs[0]||'';s.last=ls[ls.length-1]||'';
 const inter=ids=>(ids||[]).filter(x=>keep.has(x));const E=D.evo;
 for(const k of Object.keys(E)){E[k]=E[k].filter(r=>{if(k==='inference'){r[12]=r[12].filter(x=>keep.has(x[3]));r[13]=inter(r[13]);r[4]=r[12].length;return r[13].length>0;}
 if(k==='error_channel')return r[r.length-1].some(x=>keep.has(x));
@@ -1460,7 +1459,7 @@ function tag(c){return el('span',{class:'tag',style:'background:'+(C[c]||'#555')
 function infTag(){return el('span',{class:'tag inf'},'related payload (inferred)');}
 const LANEC=(()=>{const m={};for(const c of CATS){const ls=D.lanes[c]||[];ls.forEach((l,i)=>{m[c+'|'+l]=C[c];});}return m;})();
 // ---- sortable/filterable table
-function table(host,cols,rows,opts){opts=opts||{};let sortI=opts.sort||0,dir=opts.dir||1,q='',cat='',ext=null;let LIM=opts.lim||1000;
+function table(host,cols,rows,opts){opts=opts||{};let sortI=opts.sort||0,dir=opts.dir||1,q='',cat='',ext=null;let LIM=Infinity;
 const inp=el('input',{type:'search',placeholder:'filter...'});const info=el('span',{class:'muted'});const ctl=el('div',{class:'ctl'},inp);
 let sel=null;if(opts.catFilter){sel=el('select',null,el('option',{value:''},'all categories'),...CATS.map(c=>el('option',{value:c},D.labels[c])));ctl.appendChild(sel);sel.addEventListener('change',()=>{cat=sel.value;draw();});}
 const chip=el('span',{class:'chip'});ctl.appendChild(info);ctl.appendChild(chip);const tb=el('tbody');const hr=el('tr');
@@ -1487,10 +1486,10 @@ if(pos&&pos.length){det.appendChild(el('div',{class:'muted'},'Per position: \u21
 table(t,[['Kind',x=>x[0]],['Position',x=>x[1]],['Candidates',x=>x[2]],['Bounds',x=>x[3]],['Comparisons',x=>x[4]],['First',x=>x[5],x=>isoS(x[5])]],pos,{sort:5,lim:1000});}
 det.appendChild(el('div',{class:'muted'},fmt(ids.length)+' payload(s) \u2014 ',
 el('a',{href:'#s-pay',onclick:()=>PAYTABLE&&PAYTABLE.filter(new Set(ids.map(x=>UIDX.get(x)).filter(x=>x!=null)),'selected evolution entry')},'show them in the payload table')));
-for(const id of ids.slice(0,20)){const u=D.units[UIDX.get(id)];if(!u)continue;
+for(const id of ids){const u=D.units[UIDX.get(id)];if(!u)continue;
 det.appendChild(el('div',{class:'muted'},phTag(u.phase),' Unit '+u.id+' | '+u.site+u.path+' param '+u.param+' | '+u.first+' to '+u.last+' | source IPs: '+(ipl(u.ips)||'n/a')+' | statuses '+(u.statuses.join(', ')||'n/a')+' | '+u.count+' request(s)'));
 det.appendChild(el('pre',null,u.value+(u.truncated?'\n[value truncated at 4000 characters]':'')));injected(det,u.injected);}
-if(ids.length>20)det.appendChild(el('div',{class:'muted'},fmt(ids.length-20)+' more payload(s): use the link above.'));det.scrollIntoView({block:'nearest'});}
+det.scrollIntoView({block:'nearest'});}
 function simple(host,heads,rows,sort,dir){if(!rows.length)return;const t=el('div');host.appendChild(t);const det=el('div',{class:'det'});
 const click=rows.some(r=>Array.isArray(r[heads.length]));const api=table(t,heads.map((h,i)=>[h,r=>r[i]]),rows,{sort:sort||0,dir:dir||1,lim:500,onclick:click?r=>rowDetail(det,heads,r):null});
 host.appendChild(det);return api;}
@@ -1557,11 +1556,11 @@ by.addEventListener('change',()=>{drawHist();drawLanes();});rsel.addEventListene
 const mode=el('select',null,el('option',{value:'2'},'per technique'),el('option',{value:'3'},'per target'),el('option',{value:'5'},'per source IP'));host.appendChild(el('div',{class:'ctl'},'Swimlanes ',mode,el('span',{class:'muted'},'top 30 lanes by requests')));
 const lane=el('div');host.appendChild(lane);
 function drawLanes(){if(!ev.length){lane.replaceChildren(el('p',{class:'muted'},'No attack requests in this range.'));return;}const k=+mode.value;const tot=new Map();for(const e of ev)tot.set(e[k],(tot.get(e[k])||0)+e[4]);
-const keys=[...tot].sort((a,b)=>b[1]-a[1]||(a[0]<b[0]?-1:1)).slice(0,30).map(x=>x[0]);const row=new Map(keys.map((x,i)=>[x,i]));
+const keys=[...tot].sort((a,b)=>b[1]-a[1]||(a[0]<b[0]?-1:1)).map(x=>x[0]);const row=new Map(keys.map((x,i)=>[x,i]));
 const LL=300,RH=18,HH=keys.length*RH+30;const g=sv('svg',{viewBox:'0 0 '+W+' '+HH,width:'100%'});const cells=new Map();
 const ea=t0,eb=t1,ebw=bw;
 for(const e of ev){if(!row.has(e[k]))continue;const bi=Math.max(0,Math.min(NB-1,Math.floor((e[0]-ea)/ebw)));const id=e[k]+'\u0001'+bi;let c=cells.get(id);if(!c){c={r:row.get(e[k]),b:bi,n:0,cat:{},ph:{}};cells.set(id,c);}c.n+=e[4];c.cat[e[1]]=(c.cat[e[1]]||0)+e[4];c.ph[e[6]]=(c.ph[e[6]]||0)+e[4];}
-keys.forEach((x,i)=>{const t=sv('text',{x:LL-6,y:i*RH+13,'text-anchor':'end'});const lbl=k===2?tname(x):k===5?srcLabel(x):x;t.textContent=lbl.length>48?lbl.slice(0,47)+'\u2026':lbl;
+keys.forEach((x,i)=>{const t=sv('text',{x:LL-6,y:i*RH+13,'text-anchor':'end'});const lbl=k===2?tname(x):k===5?srcLabel(x):x;t.textContent=lbl.length>48?lbl.slice(0,47)+'\u2026':lbl;{const tt=sv('title',{});tt.textContent=lbl;t.appendChild(tt);}
 hover(t,()=>lbl+' ('+x+'): '+fmt(tot.get(x))+' requests');g.appendChild(t);g.appendChild(sv('line',{x1:LL,x2:W-10,y1:i*RH+RH,y2:i*RH+RH,stroke:'var(--line2)'}));});
 const cw=(W-10-LL)/NB;const php=by.value==='phase';for(const c of cells.values()){const top=CATS.reduce((a,b)=>(c.cat[b]||0)>(c.cat[a]||0)?b:a,CATS[0]);
 const r=sv('circle',{cx:LL+(c.b+.5)*cw,cy:c.r*RH+9,r:Math.min(8,2+Math.log2(1+c.n)),fill:php?PH[Object.keys(PH).reduce((a,b)=>(c.ph[b]||0)>(c.ph[a]||0)?b:a,'probing')]:C[top],'fill-opacity':.8});
@@ -1579,7 +1578,7 @@ host.appendChild(el('p',{class:'muted'},'Built from the identified payloads (dec
 host.appendChild(el('h3',null,'SQL injection'));
 const dbm=new Map();for(const r of E.dbms){const a=dbm.get(r[1])||{n:0,m:new Set(),c:new Set(),u:new Set()};a.n+=r[2];r[5].split(', ').forEach(x=>x&&a.m.add(x));a.c.add(r[0]);r[6].forEach(x=>a.u.add(x));dbm.set(r[1],a);}
 host.appendChild(el('h4',null,'DBMS fingerprint'));
-simple(host,['DBMS','Payloads','Campaigns','Markers'],[...dbm].map(([k,a])=>[k,a.n,a.c.size,[...a.m].slice(0,8).join(', '),U(a)]),1,-1);
+simple(host,['DBMS','Payloads','Campaigns','Markers'],[...dbm].map(([k,a])=>[k,a.n,a.c.size,[...a.m].join(', '),U(a)]),1,-1);
 host.appendChild(el('h4',null,'Referenced database objects (all campaigns)'));
 simple(host,['Kind','Name','First seen','Last seen','Payloads','Campaigns'],agg(E.objects.map(O),r=>r.kind+'\u0001'+r.name.toUpperCase(),r=>({kind:r.kind,name:r.name})).map(a=>[a.kind,a.name,isoS(a.first),isoS(a.last),a.n,[...a.camps].join(' '),U(a)]),2);
 host.appendChild(el('h4',null,'Blind inference: values read character by character'));
@@ -1604,7 +1603,7 @@ simple(host,['Campaign','Parameter','URL','Host','Port','Scheme','First seen','L
 // campaigns
 host.appendChild(el('h3',null,'Campaigns (chronological)'));
 simple(host,['Campaign','Site','Paths','Parameters','Source IPs','First','Last','Payloads','Requests','Categories'],D.campaigns.map(c=>[c.id,c.site,c.paths.join(' '),c.params.join(' '),ipl(c.ips),iso(c.first),iso(c.last),c.units,c.requests,Object.keys(c.cats).map(k=>D.labels[k]+' '+c.cats[k]).join(', ')]),0);
-for(const c of D.campaigns){const d=el('details',{class:'camp'});d.appendChild(el('summary',null,c.id+' \u2014 '+c.site+' '+c.paths.slice(0,3).join(' ')+(c.paths.length>3?' \u2026':'')+' | '+c.units+' payloads | '+iso(c.first)));
+for(const c of D.campaigns){const d=el('details',{class:'camp'});d.appendChild(el('summary',null,c.id+' \u2014 '+c.site+' '+c.paths.join(' ')+' | '+c.units+' payloads | '+iso(c.first)));
 let done=false;d.addEventListener('toggle',()=>{if(done||!d.open)return;done=true;campaign(d,c);});host.appendChild(d);}
 function campaign(d,c){Object.keys(c.cats).forEach(k=>d.appendChild(tag(k)));
 const nr=el('div',{class:'narr'});c.narrative.forEach(t=>nr.appendChild(el('p',null,t)));d.appendChild(nr);
@@ -1633,7 +1632,7 @@ for(const u of D.units){const key=[u.cat,u.site,u.path,u.param,u.rules.join(' ')
 if(!a){a={cat:u.cat,site:u.site,path:u.path,param:u.param,rules:u.rules,first:u.first,last:u.last,n:0,count:0,probing:0,enumeration:0,extraction:0,exploitation:0};g.set(key,a);}
 a.n++;a[u.phase]++;a.count+=u.count;if(u.first&&u.first<a.first)a.first=u.first;if(u.last>a.last)a.last=u.last;}
 const kp=el('div',{class:'kpis'});for(const c of CATS){const rs=D.units.filter(u=>u.cat===c);const rc=new Map();rs.forEach(u=>u.rules.forEach(r=>rc.set(r,(rc.get(r)||0)+1)));
-const top=[...rc].sort((a,b)=>b[1]-a[1]||(a[0]<b[0]?-1:1)).slice(0,6);kp.appendChild(el('div',{class:'kpi'},tag(c),el('b',null,fmt(rs.length)+' payloads'),
+const top=[...rc].sort((a,b)=>b[1]-a[1]||(a[0]<b[0]?-1:1));kp.appendChild(el('div',{class:'kpi'},tag(c),el('b',null,fmt(rs.length)+' payloads'),
 el('span',{class:'lbl'},new Set(rs.map(u=>u.site+u.path)).size+' endpoints'),el('div',null,phTag('probing'),' '+fmt(rs.filter(u=>u.phase==='probing').length)+' ',...(c==='sqli'?['enumeration','extraction']:['exploitation']).flatMap(p=>[phTag(p),' '+fmt(rs.filter(u=>u.phase===p).length)+' '])),el('ul',{class:'muted'},...top.map(t=>el('li',null,tname(t[0])+' ('+t[1]+')')))));}
 host.appendChild(kp);host.appendChild(el('p',{class:'muted'},'Phase, from the payload content only (it says nothing about the outcome): ',phTag('probing'),' tests whether the injection point reacts (syntax, boolean or time checks, canary files such as the account database, script markers, callbacks); ',phTag('enumeration'),' maps database structure, environment, row counts or value sizes; ',phTag('extraction'),' reads stored values from application tables; ',phTag('exploitation'),' tries to read non-canary files, run non-diagnostic commands, download or write files, take browser data or reach cloud metadata services.'));
 host.appendChild(el('h3',null,'Per target and technique'));
@@ -1678,7 +1677,7 @@ function hl(i){const on=i<0?null:adj[i];const v=j=>!on||j===i||on.has(j);circles
 L.forEach((e,j)=>{const l=G.links[j];e.setAttribute('stroke-opacity',!on?.45:(l[0]===i||l[1]===i?.95:.04));});}
 G.nodes.forEach((n,i)=>{const lbl=n[0]==='technique'?tname(n[1]):n[1];const isip=n[0]==='source_ip'||n[0]==='ip';const full=KN[n[0]]+': '+lbl+(n[0]==='technique'&&!n[1].startsWith('related:')?' ('+n[1]+')':'')+' | '+n[3]+' payload(s)'+(isip?ipi(n[1]):'');const rg=isip&&IN&&IN[n[1]]&&!IN[n[1]].error?ring(IN[n[1]].score):null;
 const c=sv('circle',{cx:px(i),cy:py(i),r:Math.min(8,3+Math.log2(1+n[3])*.8),fill:KIND[n[0]]||'#888',stroke:rg||'#fff','stroke-width':rg?3:.8,style:'cursor:pointer'});
-const t=sv('text',{x:px(i)+11,y:py(i)+4,class:'gl',style:'cursor:pointer'});t.textContent=lbl.length>32?lbl.slice(0,31)+'\u2026':lbl;
+const t=sv('text',{x:px(i)+11,y:py(i)+4,class:'gl',style:'cursor:pointer'});t.textContent=lbl.length>32?lbl.slice(0,31)+'\u2026':lbl;{const tt=sv('title',{});tt.textContent=lbl;t.appendChild(tt);}
 for(const e of [c,t]){e.addEventListener('mouseenter',()=>{if(pinned<0)hl(i);});e.addEventListener('mousemove',ev=>showTip(ev,full));e.addEventListener('mouseleave',()=>{hideTip();if(pinned<0)hl(-1);});
 e.addEventListener('click',()=>{pinned=pinned===i?-1:i;hl(pinned);if(PAYTABLE)PAYTABLE.filter(pinned<0?null:new Set(n[4]),KN[n[0]]+' '+lbl);});}
 s.appendChild(c);s.appendChild(t);circles.push(c);labels.push(t);});

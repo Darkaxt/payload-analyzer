@@ -184,9 +184,11 @@ Report views (1.8.1):
 - Values are never truncated. Clicking a row (evolution, payload, target) opens the full entry: every field, the
   inference comparison sequence and the full payload values. The inference table shows what each probe reads.
 - The IOC graph uses one node per main entity: the file name for paths, the site or IP for URLs and UNC paths.
-- No row caps (1.8.3): every evolution row, payload id and full payload value is embedded. Tables show the first
-  1,000 rows with a "show all" link; the payload-table filter also searches the full decoded values and source IPs.
-  The graph picture shows the top indicators/targets; complete lists of all indicators and targets sit below it.
+- No caps (1.9.4): every evolution row, payload id and full payload value is embedded and shown. Entry details list
+  every payload of the selected row; tables render all rows; evolution values, DBMS markers, rule lists, source IP
+  lists, campaign paths and narrative name lists are complete. Only the pictures aggregate: the source timeline
+  stacks the top 8 sources plus "other sources", and the IOC graph draws the top indicators/targets (`--ioc-top`);
+  long chart labels are shortened on screen with the full text on hover. Complete lists sit below each picture.
 - The report data is embedded encoded (XOR + Base64) and decoded by the page, so searching the HTML file as text
   finds nothing. To check where a string occurs (1.8.4):
   `python -I report_builder.py payload_analysis.json --find example.com [--find other] [--html report.html]`
