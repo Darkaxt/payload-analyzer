@@ -1155,6 +1155,23 @@ def phase_of(cat, lane, rules, analysis, text, error_calls=None):
     return 'probing'
 
 
+_SQL_TECHNIQUES = (('time_based', 'time-based'), ('error_based', 'error-based'),
+                   ('boolean_blind', 'boolean-blind'), ('union_select', 'UNION-based'),
+                   ('stacked_query', 'stacked-query'), ('out_of_band', 'out-of-band'))
+
+
+def sql_techniques(cat, rules):
+    """SQL injection technique labels shown beside the phase tag. A conditional that only
+    decides whether a delay runs is part of the time-based technique, not boolean-blind."""
+    if cat != 'sqli':
+        return []
+    found = [label for key, label in _SQL_TECHNIQUES
+             if any(r == 'sqli.' + key or r.startswith('sqli.' + key + '.') for r in rules)]
+    if 'time-based' in found and 'boolean-blind' in found:
+        found.remove('boolean-blind')
+    return found
+
+
 def lane_of(cat, rules):
     if cat == 'rce' and 'rce.database_code_execution' in rules:
         return 'command execution'
@@ -1429,7 +1446,8 @@ def build_model(report, ioc_top=40, intel=None):
             'first': str(unit.get('first_seen') or ''), 'last': str(unit.get('last_seen') or ''),
             'ts': first_ts or 0, 'count': reqs, 'ips': sorted(ips), 'statuses': sorted(statuses),
             'value': value, 'truncated': False, 'injected': injected_sections(unit, analysis),
-            'lane': lane, 'phase': phase, '_line': min(lines) if lines else 0,
+            'lane': lane, 'phase': phase, 'tech': sql_techniques(cat, eff_rules),
+            '_line': min(lines) if lines else 0,
             '_analysis': analysis, '_targets': targets, '_full': value, '_error_calls': error_calls,
         })
         for ioc in sorted({main_entity(i) for i in unit_iocs(unit, analysis)} - {None}):
@@ -1998,7 +2016,8 @@ const tname=r=>D.tech_names[r]||r;
 const IN=D.intel||null;const ipi=ip=>{const x=IN&&IN[ip];if(!x)return '';if(x.error)return ' [AbuseIPDB: '+x.error+']';return ' ['+(x.infra||'unknown')+(x.isp?' ('+x.isp+')':'')+', '+(x.country||'?')+', AbuseIPDB score '+x.score+', '+fmt(x.reports||0)+' reports]';};
 const ipl=a=>a.map(ip=>ip+ipi(ip)).join(', ');const ring=s=>s==null?null:s>=75?'#d32f2f':s>=25?'#fb8c00':s>0?'#fdd835':'#9e9e9e';
 const PH={probing:'#b8860b',enumeration:'#3554a5',extraction:'#1baf7a',exploitation:'#c62828'};const PHL={probing:'probing',enumeration:'enumeration',extraction:'extraction',exploitation:'exploitation attempt'};
-function phTag(p){return el('span',{class:'tag phase-'+p,style:'background:'+PH[p]},PHL[p]||p);}
+const phText=(p,u)=>(PHL[p]||p)+(u&&u.tech&&u.tech.length?' \u00b7 '+u.tech.join(', ')+' SQL injection':'');
+function phTag(p,u){return el('span',{class:'tag phase-'+p,style:'background:'+PH[p]},phText(p,u));}
 function tag(c){return el('span',{class:'tag',style:'background:'+(C[c]||'#555')},D.labels[c]||c);}
 function infTag(){return el('span',{class:'tag inf'},'related payload (inferred)');}
 const LANEC=(()=>{const m={};for(const c of CATS){const ls=D.lanes[c]||[];ls.forEach((l,i)=>{m[c+'|'+l]=C[c];});}return m;})();
@@ -2031,7 +2050,7 @@ table(t,[['Kind',x=>x[0]],['Position',x=>x[1]],['Candidates',x=>x[2]],['Bounds',
 det.appendChild(el('div',{class:'muted'},fmt(ids.length)+' payload(s) \u2014 ',
 el('a',{href:'#s-pay',onclick:()=>PAYTABLE&&PAYTABLE.filter(new Set(ids.map(x=>UIDX.get(x)).filter(x=>x!=null)),'selected evolution entry')},'show them in the payload table')));
 for(const id of ids){const u=D.units[UIDX.get(id)];if(!u)continue;
-det.appendChild(el('div',{class:'muted'},phTag(u.phase),' Unit '+u.id+' | '+u.site+u.path+' param '+u.param+' | '+u.first+' to '+u.last+' | source IPs: '+(ipl(u.ips)||'n/a')+' | statuses '+(u.statuses.join(', ')||'n/a')+' | '+u.count+' request(s)'));
+det.appendChild(el('div',{class:'muted'},phTag(u.phase,u),' Unit '+u.id+' | '+u.site+u.path+' param '+u.param+' | '+u.first+' to '+u.last+' | source IPs: '+(ipl(u.ips)||'n/a')+' | statuses '+(u.statuses.join(', ')||'n/a')+' | '+u.count+' request(s)'));
 det.appendChild(el('pre',null,u.value+(u.truncated?'\n[value truncated at 4000 characters]':'')));injected(det,u.injected);}
 det.scrollIntoView({block:'nearest'});}
 function simple(host,heads,rows,sort,dir){if(!rows.length)return;const t=el('div');host.appendChild(t);const det=el('div',{class:'det'});
@@ -2189,8 +2208,8 @@ table(t,[['IP',r=>r.ip],['Infrastructure',r=>r.error?'':(r.infra||'unknown'),r=>
 // ---- payload drill-down
 let PAYTABLE=null;(function(){const host=document.getElementById('payloads');const det=el('div');
 PAYTABLE=table(host,[['Unit',r=>r.id],['Category',r=>r.cat,r=>tag(r.cat)],['Campaign',r=>r.camp||''],['Site',r=>r.site],['Path',r=>r.path],['Parameter',r=>r.param],['Technique',r=>r.rules.map(tname).join('; ')],
-['Phase',r=>r.phase,r=>phTag(r.phase)],['Stage',r=>r.lane],['First seen',r=>r.first],['Requests',r=>r.count],['Summary',r=>r.summary]],D.units,{sort:9,catFilter:true,search:r=>r.value+' '+(r.ips||[]).join(' '),onclick:u=>{
-det.replaceChildren(el('h3',null,'Unit '+u.id+' ',tag(u.cat),phTag(u.phase),u.related?infTag():null),
+['Phase',r=>phText(r.phase,r),r=>phTag(r.phase,r)],['Stage',r=>r.lane],['First seen',r=>r.first],['Requests',r=>r.count],['Summary',r=>r.summary]],D.units,{sort:9,catFilter:true,search:r=>r.value+' '+(r.ips||[]).join(' '),onclick:u=>{
+det.replaceChildren(el('h3',null,'Unit '+u.id+' ',tag(u.cat),phTag(u.phase,u),u.related?infTag():null),
 el('p',null,u.summary),el('p',{class:'muted'},'Technique: '+u.rules.map(r=>tname(r)+(r.startsWith('related:')?'':' ('+r+')')).join('; ')+' | stage '+u.lane+' | campaign '+(u.camp||'-')+' | '+u.site+u.path+' param '+u.param+(u.ntargets>1?' (+'+(u.ntargets-1)+' more targets)':'')+' | source IPs: '+(ipl(u.ips)||'n/a')+' | statuses '+(u.statuses.join(', ')||'n/a')+' | '+u.first+' to '+u.last),
 el('div',{class:'muted'},'Decoded value'+(u.truncated?' (truncated)':'')+':'),el('pre',null,u.value));injected(det,u.injected);det.scrollIntoView({block:'nearest'});}});
 host.appendChild(det);})();

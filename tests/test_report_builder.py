@@ -202,6 +202,14 @@ class PhaseAndDetailTest(unittest.TestCase):
         self.assertEqual(self.phase('sqli', '', '1 UNION ' + 'SELECT NULL ' + KW_FROM + ' DUAL'), 'probing')
         self.assertEqual(self.phase('sqli', '', '1 AND AS' + 'CII(SUB' + 'STR((SELECT token ' + KW_FROM
                                     + ' app.accounts WHERE id=1),1,1))>64'), 'extraction')
+        tech = report_builder.sql_techniques
+        self.assertEqual(tech('sqli', ['sqli.time_based.heavy_query']), ['time-based'])
+        self.assertEqual(tech('sqli', ['sqli.boolean_blind.conditional_probe', 'sqli.time_based.sleep']),
+                         ['time-based'])
+        self.assertEqual(tech('sqli', ['sqli.error_based', 'sqli.union_select.x']), ['error-based', 'UNION-based'])
+        self.assertEqual(tech('sqli', ['sqli.boolean_blind.char_compare']), ['boolean-blind'])
+        self.assertEqual(tech('rce', ['sqli.time_based.sleep']), [])
+        self.assertTrue(all('tech' in u for u in report_builder.build_model(REPORT)['units']))
 
     def test_other_phases(self):
         seg = lambda p: [{'program': p, 'arguments': []}]

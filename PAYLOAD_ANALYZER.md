@@ -16,7 +16,7 @@ SQL phases distinguish probing (syntax, boolean, timing and capability checks, e
 
 SQL expressions are decoded (CHR/CHAR codes, concatenation, hex literals, SQL embedded in strings) for display and classification (1.9.6)
 
-Constant-only expressions (hashes, string functions, integer arithmetic) are resolved in the decoded form; time-delay arguments are kept verbatim (1.9.7).
+Constant-only expressions (hashes, string functions, integer arithmetic) are resolved in the decoded form; time-delay arguments are kept verbatim (1.9.7). SQL phase tags name the injection technique beside the phase, e.g. "probing · time-based SQL injection" (time-based, error-based, boolean-blind, UNION-based, stacked-query, out-of-band); a conditional that only gates a delay counts as time-based (1.9.8).
 
 ## Recommended pipeline
 
