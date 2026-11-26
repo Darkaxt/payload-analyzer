@@ -296,7 +296,7 @@ from functools import lru_cache
 _spec = importlib.util.spec_from_file_location(_text(0), Path(__file__).with_name(_text(1)))
 paxio = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(paxio)
-ANALYZER_VERSION = '1.9.5'
+ANALYZER_VERSION = '1.9.6'
 TECHNIQUE_PRIORITY = (
     ('rce.',), ('file_access.',), ('sqli.out_of_band',), ('sqli.time_based',),
     ('sqli.error_based',), ('sqli.boolean_blind',), ('sqli.union_select',),

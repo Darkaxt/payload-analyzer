@@ -366,6 +366,242 @@ def extract_inference(text):
     return found
 
 
+
+def _sql_tokens(text):
+    """Lossless tokens, including opaque comments and quoted identifiers."""
+    return re.findall(r"[xX]'(?=\s+(?i:AND|OR)\b)|(?<=[0-9a-mo-zA-MO-Z_])'(?=\s|[);])|--[^\r\n]*|\#[^\r\n]*|/\*.*?(?:\*/|$)|(?:[nNxX])?'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|\[[^\]]*\]|`[^`]*`|0[xX][0-9a-fA-F]+(?![\w$])|[\w$]+|\|\||\s+|.", text, re.S)
+
+
+def _sql_literal(token):
+    return bool(re.fullmatch(r"[nN]?'(?:''|[^'])*'", token, re.S))
+
+
+def _sql_unquote(token):
+    return token[token.index("'") + 1:-1].replace("''", "'")
+
+
+def _sql_quote(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _sql_atom(expr):
+    if _sql_literal(expr) or re.fullmatch(r'[\w.$]+', expr):
+        return True
+    call = re.match(r'[\w.$]+\s*\(', expr)
+    return bool(call and _balanced(expr, call.end() - 1) == len(expr))
+
+
+def _sql_changed(original, decoded):
+    return (''.join(t for t in _sql_tokens(original) if not t.isspace())
+            != ''.join(t for t in _sql_tokens(decoded) if not t.isspace()))
+
+
+def sql_decode(text):
+    """Deterministic display-only SQL decoding; unknown syntax remains untouched."""
+    try:
+        return _sql_annotate(_sql_simplify(_sql_decode(text, 0)))
+    except (ValueError, OverflowError, RecursionError, TypeError):
+        return text
+
+
+def _sql_decode(text, depth):
+    if depth >= 32:
+        return text
+    tokens = _sql_tokens(text)
+    out, i = [], 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token.startswith('/*!'):
+            content = re.sub(r'^/\*!\d*\s*|\*/$', '', token)
+            out.append(_sql_decode(content.strip(), depth + 1))
+            i += 1
+            continue
+        if token.startswith(('--', '#', '/*')):
+            if token == '/**/':
+                adjacent_call = (i > 0 and re.fullmatch(r'[\w.$]+', tokens[i - 1])
+                                 and i + 1 < len(tokens) and tokens[i + 1] == '(')
+                out.append('' if adjacent_call else ' ')
+            else:
+                out.append(token)
+            i += 1
+            continue
+        if token.isspace():
+            token = ' '
+        j = i + 1
+        while j < len(tokens) and tokens[j].isspace():
+            j += 1
+        name = token.upper()
+        if j < len(tokens) and tokens[j] == '(':
+            level, k = 1, j + 1
+            while k < len(tokens) and level:
+                level += (tokens[k] == '(') - (tokens[k] == ')')
+                k += 1
+            if not level:
+                inner = _sql_decode(''.join(tokens[j + 1:k - 1]), depth + 1)
+                args = _split_args(inner)
+                if name in ('CHR', 'CHAR', 'NCHR', 'NCHAR'):
+                    args = _split_args(''.join(tokens[j + 1:k - 1]))
+                replacement = None
+                if name in ('CHR', 'CHAR', 'NCHR', 'NCHAR') and len(args) == 1 and re.fullmatch(r'(?:\d+|0[xX][0-9a-fA-F]+)', args[0]):
+                    number = int(args[0], 16 if args[0].lower().startswith('0x') else 10)
+                    if 32 <= number <= 126:
+                        replacement = _sql_quote(chr(number))
+                elif name == 'CAST':
+                    cast = re.fullmatch(r"([nN]?'(?:''|[^'])*')\s+AS\s+(N?VARCHAR|N?CHAR)\s*\(\s*(\d+)\s*\)", inner, re.I)
+                    if cast:
+                        length, width = len(_sql_unquote(cast.group(1))), int(cast.group(3))
+                        if length == width or ('VARCHAR' in cast.group(2).upper() and length <= width):
+                            replacement = cast.group(1)
+                elif name == 'CONCAT' and len(args) >= 2 and all(args):
+                    # Parenthesise compound operands to preserve their precedence.
+                    replacement = '||'.join(
+                        a if _sql_atom(a) or re.fullmatch(r"[\w.$'\s]+(?:\|\|[\w.$'\s]+)+", a)
+                        or (a.startswith('(') and _balanced(a, 0) == len(a))
+                        else '(' + a + ')' for a in args)
+                if replacement is None:
+                    if name in ('GETXML', 'XMLTYPE', 'EXEC', 'EXECUTE', 'SYSCS_EXPORT_QUERY', 'SYSCS_GET_DATABASE_PROPERTY') and args and _sql_literal(args[0]):
+                        query = _sql_unquote(args[0])
+                        if re.match(r'\s*(?:SELECT|WITH|VALUES)\b', query, re.I):
+                            decoded = _sql_decode(query, depth + 1)
+                            if decoded != query or args[0].startswith(('N', 'n')):
+                                args[0] = _sql_quote(decoded)
+                                inner = ','.join(args)
+                    replacement = token + ''.join(tokens[i + 1:j + 1]) + inner + ')'
+                out.append(replacement)
+                i = k
+                continue
+        if re.fullmatch(r"0[xX][0-9a-fA-F]+|[xX]'[0-9a-fA-F]*'", token):
+            value = token[2:] if token.lower().startswith('0x') else token[2:-1]
+            if value and len(value) % 2 == 0:
+                raw = bytes.fromhex(value)
+                if all(32 <= b <= 126 for b in raw):
+                    token = _sql_quote(raw.decode('ascii'))
+        if _sql_literal(token):
+            prefix = ''.join(tokens[max(0, i - 4):i])
+            if re.search(r'(?:EXECUTE\s+IMMEDIATE|SP_EXECUTESQL)\s*$', prefix, re.I):
+                token = _sql_quote(_sql_decode(_sql_unquote(token), depth + 1))
+        out.append(token)
+        i += 1
+    text = ''.join(out)
+    # Only merge literal operands, never arithmetic or comment contents.
+    tokens = _sql_tokens(text)
+    out, i = [], 0
+    while i < len(tokens):
+        token = tokens[i]
+        if _sql_literal(token):
+            value, end = _sql_unquote(token), i + 1
+            while True:
+                j = end
+                while j < len(tokens) and tokens[j].isspace():
+                    j += 1
+                if j >= len(tokens) or tokens[j] not in ('||', '+'):
+                    break
+                k = j + 1
+                while k < len(tokens) and tokens[k].isspace():
+                    k += 1
+                if k >= len(tokens) or not _sql_literal(tokens[k]):
+                    break
+                value += _sql_unquote(tokens[k])
+                end = k + 1
+            if end > i + 1:
+                token = _sql_quote(value)
+            i = end
+        else:
+            i += 1
+        out.append(token)
+    return ''.join(' ' if t.isspace() else t for t in _sql_tokens(''.join(out)))
+
+
+def _sql_simplify(text, depth=0):
+    """Fold scalar constants and counts from the single-row dummy source."""
+    if depth >= 32:
+        return text
+    tokens = _sql_tokens(text)
+    out, i = [], 0
+    literal = r"(?:NULL|[+-]?\d+(?:\.\d+)?|'(?:''|[^'])*')"
+    dummy = r'(?:DUAL|SYSIBM\.SYSDUMMY1|RDB\$DATABASE)'
+    while i < len(tokens):
+        if tokens[i] != '(':
+            out.append(tokens[i])
+            i += 1
+            continue
+        level, end = 1, i + 1
+        while end < len(tokens) and level:
+            level += (tokens[end] == '(') - (tokens[end] == ')')
+            end += 1
+        if level:
+            out.extend(tokens[i:])
+            break
+        previous = i - 1
+        while previous >= 0 and tokens[previous].isspace():
+            previous -= 1
+        is_call = previous >= 0 and bool(re.fullmatch(r'[\w.$]+', tokens[previous]))
+        inner = _sql_simplify(''.join(tokens[i + 1:end - 1]), depth + 1).strip()
+        constant = re.fullmatch(r'(?:SELECT\s+(' + literal + r')(?:\s+FROM\s+' + dummy + r')?|VALUES\s+(' + literal + r'))', inner, re.I)
+        count = re.fullmatch(r'SELECT\s+COUNT\s*\(\s*\*\s*\)\s+FROM\s+' + dummy + r'(?:\s+WHERE\s+(.+))?', inner, re.I | re.S)
+        value = '(' + inner + ')'
+        if is_call:
+            pass
+        elif constant:
+            value = constant.group(1) or constant.group(2)
+        elif count:
+            condition = count.group(1)
+            tail = ''.join(tokens[end:])
+            comparison = re.match(r'\s*(?:>\s*0|=\s*1|>=\s*1)(?![\w.])', tail)
+            if comparison and condition:
+                value = '(' + condition + ')'
+                consumed = len(comparison.group())
+                while consumed and end < len(tokens):
+                    consumed -= len(tokens[end])
+                    end += 1
+            else:
+                value = '(CASE WHEN ' + condition + ' THEN 1 ELSE 0 END)' if condition else '1'
+        elif inner.startswith('(') and _balanced(inner, 0) == len(inner):
+            value = inner
+        elif _sql_atom(inner) and (''.join(out).rstrip().endswith('||')
+                                  or ''.join(tokens[end:]).lstrip().startswith('||')):
+            value = inner
+        out.append(value)
+        i = end
+    result = ''.join(out)
+    if re.match(r'^\s*\(+\s*SELECT\s+COUNT\s*\(', text, re.I) and re.search(r'\)\s*(?:>\s*0|=\s*1|>=\s*1)\s*\)*\s*$', text):
+        while result.startswith('(') and _balanced(result, 0) == len(result):
+            result = result[1:-1]
+    return result
+
+
+def _sql_annotate(text):
+    tokens = _sql_tokens(text)
+    masked = ''.join(' ' * len(t) if t.startswith(('--', '#', '/*')) or _sql_literal(t) else t for t in tokens)
+    edits = []
+    for match in re.finditer(r'\b(?:ASCII|ORD|UNICODE)\s*\(', masked, re.I):
+        end = _balanced(masked, match.end() - 1)
+        comparison = _inference_comparison(masked, end)
+        if comparison and 32 <= int(comparison.group(2)) <= 126:
+            pos = comparison.end()
+            note = ' /* ' + _sql_quote(chr(int(comparison.group(2)))) + ' */'
+            if not text[pos:].startswith(note):
+                edits.append((pos, note))
+    for pos, note in reversed(edits):
+        text = text[:pos] + note + text[pos:]
+    return text
+
+
+def _sql_analysis(text):
+    """Expose only recognised executable string contexts to classification."""
+    text = sql_decode(text)
+    tokens = _sql_tokens(text)
+    for i, token in enumerate(tokens):
+        if not _sql_literal(token):
+            continue
+        prefix = ''.join(tokens[:i])
+        if re.search(r'(?:GETXML|XMLTYPE|EXEC|EXECUTE|SYSCS_EXPORT_QUERY|SYSCS_GET_DATABASE_PROPERTY)\s*\(\s*$|(?:EXECUTE\s+IMMEDIATE|SP_EXECUTESQL)\s*$', prefix, re.I):
+            query = _sql_unquote(token)
+            if re.match(r'\s*(?:SELECT|WITH|VALUES)\b', query, re.I):
+                tokens[i] = '(' + _sql_analysis(query) + ')'
+    return ''.join(tokens)
+
+
 def _sql_mask(text):
     """Mask comments only: a leading breakout quote need not be balanced."""
     return re.sub(r"--[^\r\n]*|/\*.*?\*/", lambda m: ' ' * len(m.group()), text, flags=re.S)
@@ -397,11 +633,15 @@ def extract_error_channel(text, expressions=False, include_constants=False):
             queries.append((start, stop))
         submitted = [text[a + 1:b - 1] for a, b in queries]
         if not queries:
-            for arg in _split_args(text[call.end():end - 1]):
-                expr = _strip_parens(arg)
-                constant = re.sub(r"'(?:''|[^'])*'|\bNULL\b|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", '', expr, flags=re.I)
-                if re.search(r'[A-Za-z_$\"]', constant):
-                    submitted.append(expr)
+            raw_call = text[call.start():end]
+            if name.upper() in ('CAST', 'CONVERT') and _error_constant(raw_call):
+                submitted.append(raw_call)
+            else:
+                for arg in _split_args(text[call.end():end - 1]):
+                    expr = _strip_parens(_sql_analysis(arg))
+                    constant = re.sub(r"'(?:''|[^'])*'|\bNULL\b|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", '', expr, flags=re.I)
+                    if include_constants or re.search(r'[A-Za-z_$\"]', constant):
+                        submitted.append(expr)
         if submitted or include_constants:
             found.append((text[call.start():end] if expressions else name, submitted))
     return found
@@ -411,7 +651,7 @@ def error_channel_details(text, calls=None):
     """One deterministic entry per payload, retaining every submitted subquery."""
     if calls is None:
         calls = extract_error_channel(text)
-    queries = [q for _, qs in calls for q in qs]
+    queries = [_sql_analysis(q) for _, qs in calls for q in qs]
     objects, selectors = [], []
     for q in queries:
         objects.extend(m.group(1) for m in re.finditer(r'\b(?:FROM|JOIN)\s+([\w.$`"\[\]]+)', q, re.I))
@@ -545,7 +785,7 @@ def _size_measurement(expr):
 
 def _error_size(expr):
     """Only a returned count or size is exempt from error-based extraction."""
-    expr = _strip_parens(_sql_mask(expr))
+    expr = _strip_parens(_sql_mask(_sql_analysis(expr)))
     if re.match(r'SELECT\s+', expr, re.I):
         expr = re.sub(r'^SELECT\s+', '', expr, flags=re.I)
         # Find the outer FROM, not one inside a scalar subquery.
@@ -567,7 +807,56 @@ def _error_size(expr):
         r"NULL|[+-]?\d+(?:\.\d+)?|'(?:''|[^'])*'", args[1], re.I)))
 
 
+def _error_expression(expr):
+    expr = _strip_parens(_sql_analysis(expr))
+    match = re.fullmatch(r'(?:[\w$]+\.)*(?:GETXML|XMLTYPE)\s*\((.*)\)', expr, re.I | re.S)
+    return _strip_parens(match.group(1)) if match else expr
+
+
+def _error_constant(expr, depth=0):
+    """Conservative pure-expression recogniser; never evaluates SQL."""
+    if depth >= 32:
+        return False
+    expr = _error_expression(expr)
+    if re.match(r'^SELECT\s+', expr, re.I):
+        expr = re.sub(r'^SELECT\s+', '', expr, flags=re.I)
+        expr = re.sub(r'\s+FROM\s+(?:DUAL|SYSIBM\.SYSDUMMY1|RDB\$DATABASE)\s*$', '', expr, flags=re.I)
+    expr = _strip_parens(expr)
+    if re.fullmatch(r"NULL|[+-]?\d+(?:\.\d+)?|[nN]?'(?:''|[^'])*'|0[xX][0-9a-fA-F]+", expr, re.I):
+        return True
+    # A flat concatenation of literal/pure operands is also constant.
+    tokens, level, parts, current = _sql_tokens(expr), 0, [], []
+    for token in tokens:
+        if level == 0 and token in ('||', '+') and current:
+            parts.append(''.join(current))
+            current = []
+            continue
+        current.append(token)
+        level += (token == '(') - (token == ')')
+    if parts:
+        parts.append(''.join(current))
+        return all(_error_constant(part, depth + 1) for part in parts)
+    call = re.match(r'([\w.$]+)\s*\(', expr)
+    if not call or _balanced(expr, call.end() - 1) != len(expr):
+        return False
+    name, inner = call.group(1).upper(), expr[call.end():-1]
+    if name == 'CAST':
+        cast = re.fullmatch(r'(.*?)\s+AS\s+(?:N?VARCHAR|N?CHAR|INT(?:EGER)?|SIGNED|UNSIGNED|NUMERIC|DECIMAL)(?:\s*\([\d, ]+\))?', inner, re.I | re.S)
+        return bool(cast and _error_constant(cast.group(1), depth + 1))
+    args = _split_args(inner)
+    if name == 'CONVERT':
+        return (len(args) in (2, 3) and bool(re.fullmatch(r'(?:INT(?:EGER)?|SIGNED|UNSIGNED|NUMERIC|DECIMAL)(?:\s*\([\d, ]+\))?', args[0], re.I))
+                and all(_error_constant(arg, depth + 1) for arg in args[1:]))
+    pure = {'CONCAT', 'CHR', 'CHAR', 'NCHR', 'NCHAR', 'SUBSTR', 'SUBSTRING', 'MID',
+            'MD5', 'HASHBYTES', 'SYS.FN_SQLVARBASETOSTR', 'ASCII', 'ORD', 'UNICODE',
+            'LENGTH', 'LEN', 'CHAR_LENGTH', 'LOWER', 'UPPER', 'TRIM', 'LTRIM', 'RTRIM',
+            'REPLACE', 'REVERSE', 'COALESCE', 'NVL', 'IFNULL', 'TO_CHAR', 'HEX', 'UNHEX',
+            'LEFT', 'RIGHT', 'REPEAT', 'SPACE', 'ABS'}
+    return name in pure and bool(args) and all(_error_constant(arg, depth + 1) for arg in args)
+
+
 def _error_phase(expressions):
+    expressions = [_error_expression(expr) for expr in expressions if not _error_constant(expr)]
     if not expressions:
         return 'probing'
     return 'enumeration' if all(_error_size(expr) for expr in expressions) else 'extraction'
@@ -583,12 +872,16 @@ def phase_of(cat, lane, rules, analysis, text, error_calls=None):
     (tries to read stored data or non-canary files, run non-diagnostic commands, download/write files,
     steal browser data or reach metadata services)."""
     art = analysis.get('artifacts') or {}
+    if cat == 'sqli':
+        text = _sql_analysis(text)
     up = text.upper()
     if cat == 'sqli':
         if error_calls is None:
             error_calls = extract_error_channel(text)
         if any(_error_phase(expressions) == 'extraction' for _, expressions in error_calls):
             return 'extraction'
+        error_calls = [(name, expressions) for name, expressions in error_calls
+                       if _error_phase(expressions) != 'probing']
         if _SQL_EXPLOIT.search(up):
             return 'extraction'
         phases = []
@@ -729,7 +1022,7 @@ def injected_sections(unit, analysis):
                     quotes[nid].append(quote)
                 if technique.get('rule_id') == 'sqli.error_based':
                     errors.add(nid)
-    result, seen = [], set()
+    result, seen, leaf_sections = [], set(), set()
     plain_ancestors = set()
     for leaf in nodes:
         if leaf.get("transform") == "json_leaf_extract" and leaf["node_id"] in quotes:
@@ -826,6 +1119,8 @@ def injected_sections(unit, analysis):
             if rendered == whole or rendered in seen:
                 continue
             seen.add(rendered)
+            if path:
+                leaf_sections.add(rendered)
             result.append({'text': rendered, 'layer': layer})
     sources = [(section['text'], section['layer']) for section in result]
     for node in nodes or [{'node_id': 0, 'value': whole}]:
@@ -852,7 +1147,27 @@ def injected_sections(unit, analysis):
             calls_seen.add(call)
             result.append({'text': call, 'layer': layer,
                            'label': _error_label(submitted)})
-    return result
+    expanded, decoded_seen = [], set()
+    category = unit.get('effective_category') or analysis.get('category')
+    try:
+        whole_document = isinstance(json.loads(whole), (dict, list))
+    except (ValueError, TypeError, RecursionError):
+        whole_document = False
+    decoded_whole = sql_decode(whole) if category in (None, 'sqli') and not whole_document else whole
+    if _sql_changed(whole, decoded_whole):
+        expanded.append({'text': decoded_whole, 'layer': '', 'label': 'Decoded SQL'})
+        decoded_seen.add(decoded_whole)
+    for section in result:
+        expanded.append(section)
+        error_section = section.get('label', '').startswith('Error-based')
+        eligible = error_section or (category in (None, 'sqli') and section['text'] in leaf_sections)
+        if not eligible:
+            continue
+        decoded = sql_decode(section['text'])
+        if _sql_changed(section['text'], decoded) and decoded not in decoded_seen:
+            decoded_seen.add(decoded)
+            expanded.append({'text': decoded, 'layer': section['layer'], 'label': 'Decoded SQL'})
+    return expanded
 
 
 # ---------------------------------------------------------------- model
@@ -926,7 +1241,7 @@ def build_model(report, ioc_top=40, intel=None):
         lane_rules = rules or ([related[8:]] if related[8:] in tech_names else [])
         primary = eff_rules[0]
         value = str(unit.get('final_decoded_value') or unit.get('url_decoded_value') or '')
-        error_calls = extract_error_channel(value, expressions=True) if cat == 'sqli' else []
+        error_calls = extract_error_channel(value, expressions=True, include_constants=True) if cat == 'sqli' else []
         lane = lane_of(cat, lane_rules)
         phase = phase_of(cat, lane, eff_rules, analysis, value, error_calls)
         if cat == 'sqli' and phase in ('enumeration', 'extraction'):
@@ -1145,7 +1460,8 @@ def analyse_campaign(cid, us):
         if cat == 'sqli':
             if u['_error_calls']:
                 error_rows.append([cid, ts, u['count'], ', '.join(u['statuses']),
-                                   *error_channel_details(text, u['_error_calls']), u['phase'], [u['id']]])
+                                   *error_channel_details(text, u['_error_calls']),
+                                   _error_phase([expr for _, expressions in u['_error_calls'] for expr in expressions]), [u['id']]])
             hint = _HINT_NAMES.get(str(a.get('dbms_hint') or '').lower())
             seen = set()
             if hint:

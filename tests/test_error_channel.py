@@ -68,7 +68,11 @@ class ErrorChannelTests(unittest.TestCase):
                                    'evidence': [{'node_id': 0, 'quote': SN + '('}]}]}
         section_unit = {'final_decoded_value': value, 'decoding_nodes': [{'node_id': 0, 'value': value}]}
         self.assertEqual(report.injected_sections(section_unit, evidence),
-                         [{'text': call, 'layer': '', 'label': 'Error-based extraction'}])
+                         [{'text': report.sql_decode(section_unit['final_decoded_value']),
+                           'layer': '', 'label': 'Decoded SQL'},
+                          {'text': call, 'layer': '', 'label': 'Error-based extraction'},
+                          {'text': SN + '(1,(SELECT owner FROM SYS.All_Tab_Columns WHERE ROWNUM=1))',
+                           'layer': '', 'label': 'Decoded SQL'}])
         count = SN + '(1,(SELECT COUNT(*) FROM APP.USERS))'
         for text, expected in [(count, 'Error-based enumeration'), (SN + '(1,1)', 'Error-based probe')]:
             section_unit['final_decoded_value'] = '1=' + text
@@ -78,7 +82,11 @@ class ErrorChannelTests(unittest.TestCase):
         section_unit['final_decoded_value'] = '1=' + call + ' AND 2=' + count
         section_unit['decoding_nodes'][0]['value'] = section_unit['final_decoded_value']
         self.assertEqual(report.injected_sections(section_unit, evidence),
-                         [{'text': call, 'layer': '', 'label': 'Error-based extraction'},
+                         [{'text': report.sql_decode(section_unit['final_decoded_value']),
+                           'layer': '', 'label': 'Decoded SQL'},
+                          {'text': call, 'layer': '', 'label': 'Error-based extraction'},
+                          {'text': SN + '(1,(SELECT owner FROM SYS.All_Tab_Columns WHERE ROWNUM=1))',
+                           'layer': '', 'label': 'Decoded SQL'},
                           {'text': count, 'layer': '', 'label': 'Error-based enumeration'}])
         self.assertEqual(report.phase_of('sqli', 'x', [], {}, "1' AND (SELECT PASS FROM USERS WHERE ID=1)='a"),
                          'extraction')
@@ -101,11 +109,12 @@ class ErrorChannelTests(unittest.TestCase):
             model = report.build_model({'units': units})
             self.assertEqual(parse.call_count, 2 * len(units))
         rows = model['evo']['error_channel']
-        self.assertEqual([r[9] for r in rows], [['1'], ['0']])
-        self.assertEqual(rows[1][2:4], [2, '500'])
-        self.assertEqual(rows[1][5], long_query)
-        self.assertIn('ALL_' + 'TABLES', rows[1][6])
-        self.assertIn('R=3', rows[1][7])
+        self.assertEqual([r[9] for r in rows], [['2'], ['1'], ['0']])
+        self.assertEqual(rows[0][8], 'probing')
+        self.assertEqual(rows[2][2:4], [2, '500'])
+        self.assertEqual(rows[2][5], long_query)
+        self.assertIn('ALL_' + 'TABLES', rows[2][6])
+        self.assertIn('R=3', rows[2][7])
         for u in model['units']:
             if u['id'] == '0':
                 self.assertEqual((u['lane'], u['phase']), ('data extraction / inference', 'extraction'))

@@ -14,6 +14,8 @@ Campaign examples and entry details retain their payload and add an untruncated,
 
 SQL phases distinguish probing (syntax, boolean, timing and capability checks, e.g. `1=1`), enumeration (structure, environment, row counts and value sizes, e.g. `SELECT COUNT(PASSWORDHASH) FROM APP.T`) and extraction (stored application values, e.g. `SELECT EMAIL FROM APP.T`). This applies across error, direct and blind channels. Anything returned through an error channel, except a pure count or size, is extraction (1.9.5). Nonconstant error-channel arguments appear as Submitted expression with a Kind column. Enumeration uses the metadata lane; extraction uses the data extraction / inference lane. Database-hosted Java execution, executable scheduler jobs and Java-extension XSLT use the command-execution lane: bare capability checks remain probes and supplied actions are exploitation attempts. Plain XSLT without extension namespaces remains SQL injection enumeration. JSON-leaf excerpts suppress ancestor and bracket-only duplicates. Classification does not establish execution or impact.
 
+SQL expressions are decoded (CHR/CHAR codes, concatenation, hex literals, SQL embedded in strings) for display and classification (1.9.6)
+
 ## Recommended pipeline
 
 ```

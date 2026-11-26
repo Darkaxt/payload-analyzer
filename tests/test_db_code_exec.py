@@ -64,15 +64,25 @@ class DatabaseCodeTests(unittest.TestCase):
                                (SCHED, ('rce', 'exploitation', 'command execution'))]:
             result = row(expr)
             self.assertEqual((result['cat'], result['phase'], result['lane']), expected)
-            self.assertEqual(len(result['injected']), 4 if expr == B else 2)
+            self.assertEqual(len(result['injected']), 5 if expr == B else 2)
             self.assertTrue(result['injected'][0]['text'].startswith('[0].ID: '))
-            self.assertEqual(result['injected'][1]['label'], 'Error-based extraction')
+            if expr == B:
+                decoded = result['injected'][1]
+                self.assertEqual(decoded['label'], 'Decoded SQL')
+                self.assertEqual(decoded['text'], report.sql_decode('[0].ID: ' + sample(expr)))
+                self.assertNotEqual(decoded['text'], result['injected'][0]['text'])
+            else:
+                self.assertFalse(any(s.get('label') == 'Decoded SQL' for s in result['injected']))
+            self.assertEqual(result['injected'][2 if expr == B else 1]['label'], 'Error-based extraction')
         expr = "(SELECT CoNcAt(CoNcAt(CoNcAt(owner,'.'),table_name),':') FROM SYS.All_Tab_Columns WHERE (column_name LIKE '%PASS%' OR column_name LIKE '%TOKEN%') AND owner='U' AND ROWNUM=1)"
         result = row(expr)
         self.assertEqual((result['phase'], result['lane']), ('extraction', 'data extraction / inference'))
         self.assertEqual(result['injected'][0]['text'], '[0].ID: ' + sample(expr))
-        self.assertEqual(result['injected'][1]['text'], SN + '(1,(' + expr + '))')
-        self.assertEqual(result['injected'][1]['label'], 'Error-based extraction')
+        self.assertEqual(result['injected'][1]['label'], 'Decoded SQL')
+        self.assertEqual(result['injected'][1]['text'], report.sql_decode('[0].ID: ' + sample(expr)))
+        self.assertNotEqual(result['injected'][0]['text'], result['injected'][1]['text'])
+        self.assertEqual(result['injected'][2]['text'], SN + '(1,(' + expr + '))')
+        self.assertEqual(result['injected'][2]['label'], 'Error-based extraction')
 
     def test_sql_values_vs_structure(self):
         cases = [(SN + '(1,(SELECT TABLE_NAME FROM ALL_TABLES WHERE R=3))', 'extraction'),

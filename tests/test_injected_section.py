@@ -26,6 +26,7 @@ class InjectedSectionTests(unittest.TestCase):
         sections = report.injected_sections(value, value['analysis'])
         self.assertEqual([s['text'] for s in sections], [
             '[0].onStatisticField: ' + expression, '[0].number: 314'])
+        self.assertFalse(any(s.get('label') == 'Decoded SQL' for s in sections))
         value['decoding_nodes'].append({'node_id': 1, 'parent_node_id': 0,
                                        'transform': 'json_leaf_extract', 'value': expression})
         value['analysis']['techniques'][0]['evidence'] = [{'node_id': 1, 'quote': 'SELECT synthetic_value'}]
@@ -39,8 +40,9 @@ class InjectedSectionTests(unittest.TestCase):
     def test_breakout_scope_omission_and_layer(self):
         text = "ordinary' );  AND 7=7-- synthetic tail"
         value = sample(text, ['AND 7=7'])
-        self.assertEqual(report.injected_sections(value, value['analysis'])[0]['text'],
-                         "' );  AND 7=7-- synthetic tail")
+        sections = report.injected_sections(value, value['analysis'])
+        self.assertEqual(sections[0]['text'], "' );  AND 7=7-- synthetic tail")
+        self.assertFalse(any(s.get('label') == 'Decoded SQL' for s in sections))
         value = sample('AND 7=7', ['AND 7=7'])
         self.assertEqual(report.injected_sections(value, value['analysis']), [])
         cases = [
@@ -60,7 +62,13 @@ class InjectedSectionTests(unittest.TestCase):
             with self.subTest(text=text):
                 candidate = sample(text, [quote])
                 sections = report.injected_sections(candidate, candidate['analysis'])
-                self.assertEqual([s['text'] for s in sections], [] if expected is None else [expected])
+                decoded_whole = report.sql_decode(text)
+                expected_sections = [decoded_whole] if report._sql_changed(text, decoded_whole) else []
+                if expected_sections:
+                    self.assertEqual('Decoded SQL', sections[0]['label'])
+                if expected is not None:
+                    expected_sections.append(expected)
+                self.assertEqual([s['text'] for s in sections], expected_sections)
                 if text == '$(id)':
                     candidate['final_decoded_value'] = 'opaque'
                     candidate['decoding_nodes'][0].update(
@@ -82,7 +90,11 @@ class InjectedSectionTests(unittest.TestCase):
                      'CONVERT(INT,(SELECT TOP 1 name FROM synthetic_rows))',
                      'EXTRACTVALUE(1,CONCAT(0x7e,(SELECT user())))']:
             value = sample('prefix AND ' + call + '-- tail', [call.split('(')[0]], 'sqli.error_based')
-            self.assertEqual(report.injected_sections(value, value['analysis'])[0]['text'], call)
+            sections = report.injected_sections(value, value['analysis'])
+            self.assertEqual(next(s['text'] for s in sections
+                                  if s.get('label', '').startswith('Error-based')), call)
+            if report.sql_decode(value['final_decoded_value']) != value['final_decoded_value']:
+                self.assertEqual(sections[0]['label'], 'Decoded SQL')
             details = report.error_channel_details(value['final_decoded_value'],
                          report.extract_error_channel(value['final_decoded_value'], expressions=True))
             self.assertEqual(details[0], call)
