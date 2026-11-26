@@ -2,6 +2,10 @@
 
 Python 3.10+, standard library only. No network, model service or payload execution.
 
+## Error-channel extraction (1.9.1)
+
+Value-returning subqueries submitted inside error functions are classified as data extraction / inference and exploitation attempts, including dictionary and schema reads. Constant-only errors remain probes; boolean-blind checks retain their existing classification. Campaign evolution lists the submitted error function, full verbatim subquery, referenced tables/views and row selectors with first-seen time, request count and statuses. Focus mode filters these entries; the executive summary counts the payloads. These descriptions do not establish successful extraction or impact.
+
 ## Recommended pipeline
 
 ```

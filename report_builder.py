@@ -24,6 +24,9 @@ from urllib.parse import unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import paxio  # noqa: E402
+from payload_analyzer import _DATA as _SQL_DATA  # noqa: E402
+
+_ERROR_CHANNEL = re.compile(_SQL_DATA['error_channel'], re.I)
 
 # Determined attack categories in priority order: (key, label, badge colour; white text >= 4.5:1).
 CATEGORIES = (
@@ -355,6 +358,55 @@ def extract_inference(text):
     return found
 
 
+def _sql_mask(text):
+    """Mask comments only: a leading breakout quote need not be balanced."""
+    return re.sub(r"--[^\r\n]*|/\*.*?\*/", lambda m: ' ' * len(m.group()), text, flags=re.S)
+
+
+def extract_error_channel(text):
+    """Return error functions and their verbatim scalar subqueries, not observed results."""
+    if not _ERROR_CHANNEL.search(text):
+        return []
+    masked = _sql_mask(text)
+    found = []
+    for call in _ERROR_CHANNEL.finditer(masked):
+        end = _balanced(masked, call.end() - 1)
+        if end < 0:
+            continue
+        name = text[call.start():call.end() - 1].strip()
+        if name.upper() in ('CAST', 'CONVERT'):
+            args = masked[call.end():end - 1]
+            if not re.search(r'\b(?:AS\s+|^\s*)(?:INT(?:EGER)?|SIGNED|UNSIGNED|NUMERIC|DECIMAL)\b', args, re.I):
+                continue
+        queries = []
+        # Only the call's own arguments have a known quote context.
+        inner = re.sub(r"'(?:''|[^'])*'", lambda m: ' ' * len(m.group()), masked[call.end():end - 1])
+        for sub in re.finditer(r'\(\s*SELECT\b', inner, re.I):
+            start = call.end() + sub.start()
+            stop = _balanced(masked, start)
+            if stop < 0 or stop > end or any(a <= start < b for a, b in queries):
+                continue
+            queries.append((start, stop))
+        if queries:
+            found.append((name, [text[a + 1:b - 1] for a, b in queries]))
+    return found
+
+
+def error_channel_details(text, calls=None):
+    """One deterministic entry per payload, retaining every submitted subquery."""
+    if calls is None:
+        calls = extract_error_channel(text)
+    queries = [q for _, qs in calls for q in qs]
+    objects, selectors = [], []
+    for q in queries:
+        objects.extend(m.group(1) for m in re.finditer(r'\b(?:FROM|JOIN)\s+([\w.$`"\[\]]+)', q, re.I))
+        selectors.extend(m.group().strip() for m in re.finditer(
+            r'\b(?:ROWNUM|R)\s*(?:<=|>=|=|<|>)\s*\d+|\b(?:OFFSET|LIMIT|TOP)\s*\(?\s*\d+(?:\s*,\s*\d+)?\)?(?:\s+OFFSET\s+\d+)?|'
+            r"\bWHERE\s+[^()]+?(?=\b(?:ORDER\s+BY|GROUP\s+BY|LIMIT|OFFSET)\b|$)", q, re.I))
+    return (', '.join(dict.fromkeys(n for n, _ in calls)), '\n\n'.join(queries),
+            ', '.join(dict.fromkeys(objects)), '; '.join(dict.fromkeys(selectors)))
+
+
 def derive_bounds(seq):
     """Bounds implied by an attacker's threshold sequence [(op, n), ...] in chronological order.
 
@@ -462,14 +514,16 @@ _XSS_EXPLOIT = re.compile(r'document\s*\.\s*cookie|localStorage|sessionStorage|\
 _METADATA_HOSTS = ('169.254.169.254', 'metadata.google.internal', '100.100.100.200', 'fd00:ec2::254', '169.254.170.2')
 
 
-def phase_of(cat, lane, rules, analysis, text):
+def phase_of(cat, lane, rules, analysis, text, error_calls=None):
     """'probing' (tests whether the injection point reacts, fingerprints, enumerates) or 'exploitation'
     (tries to read stored data or non-canary files, run non-diagnostic commands, download/write files,
     steal browser data or reach metadata services)."""
     art = analysis.get('artifacts') or {}
     up = text.upper()
     if cat == 'sqli':
-        if _SQL_EXPLOIT.search(up):
+        if error_calls is None:
+            error_calls = extract_error_channel(text)
+        if error_calls or _SQL_EXPLOIT.search(up):
             return 'exploitation'
         for m in _SELECT_FROM.finditer(up):
             cols, t = m.group(1).strip(), m.group(2).strip('`"[]')
@@ -592,8 +646,11 @@ def build_model(report, ioc_top=40, intel=None):
         lane_rules = rules or ([related[8:]] if related[8:] in tech_names else [])
         primary = eff_rules[0]
         value = str(unit.get('final_decoded_value') or unit.get('url_decoded_value') or '')
+        error_calls = extract_error_channel(value) if cat == 'sqli' else []
         lane = lane_of(cat, lane_rules)
-        phase = phase_of(cat, lane, eff_rules, analysis, value)
+        if error_calls:
+            lane = LANES['sqli'][3]
+        phase = phase_of(cat, lane, eff_rules, analysis, value, error_calls)
         for occ in occs:
             tg = occ.get('target') or {}
             act = occ.get('activity') or {}
@@ -616,7 +673,7 @@ def build_model(report, ioc_top=40, intel=None):
             'ts': first_ts or 0, 'count': reqs, 'ips': sorted(ips), 'statuses': sorted(statuses),
             'value': value, 'truncated': False,
             'lane': lane, 'phase': phase, '_line': min(lines) if lines else 0,
-            '_analysis': analysis, '_targets': targets, '_full': value,
+            '_analysis': analysis, '_targets': targets, '_full': value, '_error_calls': error_calls,
         })
         for ioc in sorted({main_entity(i) for i in unit_iocs(unit, analysis)} - {None}):
             ioc_units[ioc].add(uid)
@@ -736,7 +793,7 @@ def build_evolution(rows):
     groups = sorted(_merge_campaigns(rows), key=lambda g: (rows[g[0]]['ts'], rows[g[0]]['site'], rows[g[0]]['id']))
     campaigns = []
     evo = {k: [] for k in ('dbms', 'objects', 'inference', 'strings', 'commands', 'callbacks', 'rfiles', 'files', 'xss',
-                           'ssrf')}
+                           'ssrf', 'error_channel')}
     for n, g in enumerate(groups, 1):
         cid = 'C{:02d}'.format(n)
         us = [rows[i] for i in g]
@@ -793,6 +850,7 @@ def _rows_out(cid, table, fmt, omitted, name):
 
 def analyse_campaign(cid, us):
     dbms, objects, infer, cmds, cbs, rfiles, files, xss, ssrf = {}, {}, {}, {}, {}, {}, {}, {}, {}
+    error_rows = []
     dbms_markers = defaultdict(Counter)
     lanes, examples = Counter(), defaultdict(list)
     for u in us:
@@ -804,6 +862,9 @@ def analyse_campaign(cid, us):
         if len(examples[lane]) < 3 and clip(text, MAX_EXAMPLE) not in examples[lane]:
             examples[lane].append(clip(text, MAX_EXAMPLE))
         if cat == 'sqli':
+            if u['_error_calls']:
+                error_rows.append([cid, ts, u['count'], ', '.join(u['statuses']),
+                                   *error_channel_details(text, u['_error_calls']), [u['id']]])
             hint = _HINT_NAMES.get(str(a.get('dbms_hint') or '').lower())
             seen = set()
             if hint:
@@ -864,8 +925,10 @@ def analyse_campaign(cid, us):
                 m = re.match(r'^([a-zA-Z][a-zA-Z0-9+.-]*)://(?:[^/@]*@)?(\[[^\]]+\]|[^/:?#]+)(?::(\d+))?', url)
                 scheme, host, port = (m.group(1).lower(), m.group(2), m.group(3) or '') if m else ('', '', '')
                 _bump(ssrf, (u['param'], clip(url, MAX_VALUE), host, port, scheme), ts, uid=u['id'])
+    error_rows.sort(key=lambda r: (r[0], r[1], r[5], r[8][0]))
     omitted = {}
     out = {
+        'error_channel': error_rows,
         'dbms': _rows_out(cid, dbms, lambda k, v: [k, v['n'], v['first'], v['last'],
                                                    ', '.join(_top(dbms_markers[k], 5))], omitted, 'dbms'),
         'objects': _rows_out(cid, objects, lambda k, v: [k[0], k[1], v['first'], v['last'], v['n']], omitted, 'objects'),
@@ -1148,6 +1211,7 @@ s.sites=[...new Set(units.map(u=>u.site))].sort();s.endpoints=new Set(units.map(
 s.related=units.filter(u=>u.related).length;s.source_ip_total=ips.size;const sc={};units.forEach(u=>(u.ips||[]).forEach(ip=>{sc[ip]=(sc[ip]||0)+u.count;}));s.source_ips=Object.entries(sc).sort((a,b)=>b[1]-a[1]||(a[0]<b[0]?-1:1)).slice(0,20);const fs=units.map(u=>u.first).filter(Boolean).sort(),ls=units.map(u=>u.last).filter(Boolean).sort();s.first=fs[0]||'';s.last=ls[ls.length-1]||'';
 const inter=ids=>(ids||[]).filter(x=>keep.has(x));const E=D.evo;
 for(const k of Object.keys(E)){E[k]=E[k].filter(r=>{if(k==='inference'){r[12]=r[12].filter(x=>keep.has(x[3]));r[13]=inter(r[13]);r[4]=r[12].length;return r[13].length>0;}
+if(k==='error_channel')return r[r.length-1].some(x=>keep.has(x));
 if(k==='strings'){r[9]=inter(r[9]);return r[9].length>0;}const i=r.length-1;r[i]=inter(r[i]);if(!r[i].length)return false;const ni=k==='dbms'?2:i-1;if(typeof r[ni]==='number')r[ni]=r[i].length;return true;});}
 const byC=new Map();units.forEach(u=>{if(!byC.has(u.camp))byC.set(u.camp,[]);byC.get(u.camp).push(u);});
 D.campaigns=D.campaigns.filter(c=>byC.has(c.id)).map(c=>{const us=byC.get(c.id),ln=new Map(),cats={};us.forEach(u=>{const k=u.cat+'|'+u.lane+'\u0001'+m60(u.ts);ln.set(k,(ln.get(k)||0)+u.count);cats[u.cat]=(cats[u.cat]||0)+1;});
@@ -1221,6 +1285,7 @@ box.appendChild(k);
 const p=[];p.push('Between '+(s.first||'n/a')+' and '+(s.last||'n/a')+', '+fmt(req)+' web requests carried '+fmt(tot)+' distinct payloads identified as attack attempts. ');
 p.push('They targeted '+fmt(s.endpoints)+' endpoint(s) ('+fmt(s.params)+' parameter(s)) on '+fmt(s.sites.length)+' site(s): '+s.sites.join(', ')+', grouped into '+fmt(s.campaigns)+' campaign(s). ');
 p.push('By category: '+CATS.map(c=>D.labels[c]+' '+fmt(s.units[c])+' payloads in '+fmt(s.requests[c])+' requests').join('; ')+'. ');
+if(D.evo.error_channel.length)p.push(fmt(D.evo.error_channel.length)+' error-channel extraction payload(s) were submitted; outcomes are not established. ');
 if(s.related)p.push(fmt(s.related)+' of these payloads are related payloads, inferred from neighbouring identified payloads on the same parameter. ');
 if(s.source_ip_total)p.push('Requests came from '+fmt(s.source_ip_total)+' source address(es) as recorded in the export. ');
 if(IN){const src=D.src_all.filter(ip=>IN[ip]&&!IN[ip].error);const rep=src.filter(ip=>IN[ip].reports>0);const mx=Math.max(0,...src.map(ip=>IN[ip].score||0));
@@ -1331,6 +1396,7 @@ d.appendChild(g);
 const f=k=>E[k].filter(r=>r[0]===c.id);const sec=(h,heads,rows,s)=>{if(rows.length){d.appendChild(el('h4',null,h));simple(d,heads,rows,s||0);}};
 sec('DBMS fingerprint',['DBMS','Payloads','First','Last','Markers'],f('dbms').map(r=>[r[1],r[2],isoS(r[3]),isoS(r[4]),r[5],r[6]]));
 sec('Database objects',['Kind','Name','First','Last','Payloads'],f('objects').map(r=>[r[1],r[2],isoS(r[3]),isoS(r[4]),r[5],r[6]]),2);
+sec('Error-channel extraction',['First seen (UTC)','Requests','Statuses','Error function','Submitted subquery','Table / view','Row selector'],f('error_channel').map(r=>[isoS(r[1]),r[2],r[3],r[4],r[5],r[6],r[7],r[8]]));
 sec('Values read by blind inference',VH.slice(1),f('strings').map(r=>vrow(r).slice(1)),6);
 sec('Commands and expressions',['Command / expression','Family','First','Last','Payloads'],f('commands').map(r=>[r[1],r[2],isoS(r[3]),isoS(r[4]),r[5],r[6]]),2);
 sec('External references',['Kind','Value','First','Last','Payloads'],f('callbacks').map(r=>[r[1],r[2],isoS(r[3]),isoS(r[4]),r[5],r[6]]),2);
