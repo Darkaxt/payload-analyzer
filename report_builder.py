@@ -363,7 +363,7 @@ def _sql_mask(text):
     return re.sub(r"--[^\r\n]*|/\*.*?\*/", lambda m: ' ' * len(m.group()), text, flags=re.S)
 
 
-def extract_error_channel(text):
+def extract_error_channel(text, expressions=False):
     """Return error functions and their verbatim scalar subqueries, not observed results."""
     if not _ERROR_CHANNEL.search(text):
         return []
@@ -388,7 +388,8 @@ def extract_error_channel(text):
                 continue
             queries.append((start, stop))
         if queries:
-            found.append((name, [text[a + 1:b - 1] for a, b in queries]))
+            found.append((text[call.start():end] if expressions else name,
+                          [text[a + 1:b - 1] for a, b in queries]))
     return found
 
 
@@ -575,6 +576,102 @@ def lane_of(cat, rules):
     return lanes[min(best, len(lanes) - 1)]
 
 
+def injected_sections(unit, analysis):
+    """Evidence-scoped excerpts, computed once for each displayed attack unit."""
+    nodes = unit.get('decoding_nodes') or []
+    by_id = {n['node_id']: n for n in nodes}
+    quotes = defaultdict(list)
+    errors = set()
+    for technique in analysis.get('techniques') or []:
+        if str(technique.get('rule_id', '')).split('.', 1)[0] not in ATTACK:
+            continue
+        for evidence in technique.get('evidence') or []:
+            nid, quote = evidence.get('node_id'), evidence.get('quote')
+            if nid in by_id and quote and quote in by_id[nid].get('value', ''):
+                if quote not in quotes[nid]:
+                    quotes[nid].append(quote)
+                if technique.get('rule_id') == 'sqli.error_based':
+                    errors.add(nid)
+    result, seen = [], set()
+    whole = str(unit.get('final_decoded_value') or unit.get('url_decoded_value') or '')
+
+    class Number(str):
+        pass
+
+    def leaves(value, path=''):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                route = (path + '.' + key if re.fullmatch(r'[A-Za-z_$][\w$]*', key)
+                         else path + '[' + json.dumps(key, ensure_ascii=False) + ']')
+                yield from leaves(child, route.lstrip('.'))
+        elif isinstance(value, list):
+            for i, child in enumerate(value):
+                yield from leaves(child, path + '[' + str(i) + ']')
+        elif isinstance(value, str):
+            if not isinstance(value, Number):
+                try:
+                    nested = json.loads(value, parse_int=Number, parse_float=Number)
+                except (ValueError, TypeError, RecursionError):
+                    nested = None
+                if isinstance(nested, (dict, list)):
+                    yield from leaves(nested, path)
+                    return
+            yield path, str(value)
+
+    for node in nodes:
+        nid = node['node_id']
+        if nid not in quotes:
+            continue
+        text = node['value']
+        chain, visited, current = [], set(), node
+        documents = []
+        while current is not None and current['node_id'] not in visited:
+            visited.add(current['node_id'])
+            chain.append(str(current.get('transform') or current['node_id']))
+            try:
+                document = json.loads(current['value'], parse_int=Number, parse_float=Number)
+                if isinstance(document, (dict, list)):
+                    documents.append(list(leaves(document)))
+            except (ValueError, TypeError, RecursionError):
+                pass
+            current = by_id.get(current.get('parent_node_id'))
+        layer = ' -> '.join(reversed(chain)) if node.get('parent_node_id') is not None else ''
+        selected = []
+        for document in documents:
+            selected = [(path, value) for path, value in document
+                        if any(q in value for q in quotes[nid])]
+            if selected:
+                break
+        if not selected and nid in errors:
+            selected = [('', call) for call, _ in extract_error_channel(text, expressions=True)
+                        if any(q in call for q in quotes[nid])]
+        if not selected:
+            first = min(i for q in quotes[nid] for i in _positions(text, q))
+            breakout = next((i for i, ch in enumerate(text[:first + 1])
+                             if ch in "'\"`;|&$()<>{}"), None)
+            start = first if breakout is None else breakout
+            if breakout is None:
+                while start and not text[start - 1].isspace():
+                    start -= 1
+                while start < len(text) and text[start].isspace():
+                    start += 1
+            section = text[start:]
+            if section.strip() == text.strip():
+                continue
+            selected = [('', section)]
+        for path, value in selected:
+            if nid in errors:
+                calls = extract_error_channel(value, expressions=True)
+                if calls:
+                    value = '\n\n'.join(dict.fromkeys(call for call, _ in calls))
+            rendered = (path + ': ' if path else '') + value
+            if rendered == whole or rendered in seen:
+                continue
+            seen.add(rendered)
+            result.append({'text': rendered, 'layer': layer})
+    return result
+
+
 # ---------------------------------------------------------------- model
 def build_model(report, ioc_top=40, intel=None):
     meta = report.get('meta') or {}
@@ -646,7 +743,7 @@ def build_model(report, ioc_top=40, intel=None):
         lane_rules = rules or ([related[8:]] if related[8:] in tech_names else [])
         primary = eff_rules[0]
         value = str(unit.get('final_decoded_value') or unit.get('url_decoded_value') or '')
-        error_calls = extract_error_channel(value) if cat == 'sqli' else []
+        error_calls = extract_error_channel(value, expressions=True) if cat == 'sqli' else []
         lane = lane_of(cat, lane_rules)
         if error_calls:
             lane = LANES['sqli'][3]
@@ -671,7 +768,7 @@ def build_model(report, ioc_top=40, intel=None):
             'summary': str(analysis.get('summary') or ''),
             'first': str(unit.get('first_seen') or ''), 'last': str(unit.get('last_seen') or ''),
             'ts': first_ts or 0, 'count': reqs, 'ips': sorted(ips), 'statuses': sorted(statuses),
-            'value': value, 'truncated': False,
+            'value': value, 'truncated': False, 'injected': injected_sections(unit, analysis),
             'lane': lane, 'phase': phase, '_line': min(lines) if lines else 0,
             '_analysis': analysis, '_targets': targets, '_full': value, '_error_calls': error_calls,
         })
@@ -853,6 +950,7 @@ def analyse_campaign(cid, us):
     error_rows = []
     dbms_markers = defaultdict(Counter)
     lanes, examples = Counter(), defaultdict(list)
+    example_sections = defaultdict(list)
     for u in us:
         a, text, ts, cat = u['_analysis'], u['_full'], u['ts'], u['cat']
         art = a.get('artifacts') or {}
@@ -861,6 +959,7 @@ def analyse_campaign(cid, us):
         lanes[(lane, ts // 60 * 60)] += u['count']
         if len(examples[lane]) < 3 and clip(text, MAX_EXAMPLE) not in examples[lane]:
             examples[lane].append(clip(text, MAX_EXAMPLE))
+            example_sections[lane].append(u['injected'])
         if cat == 'sqli':
             if u['_error_calls']:
                 error_rows.append([cid, ts, u['count'], ', '.join(u['statuses']),
@@ -1002,7 +1101,8 @@ def analyse_campaign(cid, us):
         'first': first, 'last': last, 'units': len(us), 'requests': sum(u['count'] for u in us),
         'cats': {c: cats[c] for c in ATTACK if cats[c]},
         'lanes': sorted([k[0], k[1], n] for k, n in lanes.items()),
-        'examples': {k: v for k, v in sorted(examples.items())}, 'omitted': omitted,
+        'examples': {k: v for k, v in sorted(examples.items())},
+        'example_sections': dict(sorted(example_sections.items())), 'omitted': omitted,
         'narrative': narrative(us, out, ips, params, paths, first, last),
     }
     out['card'] = card
@@ -1259,6 +1359,7 @@ if(opts.onclick)tr.addEventListener('click',()=>{tb.querySelectorAll('tr.sel').f
 draw();const api={search(v){inp.value=v;q=String(v).toLowerCase();draw();return idx0();},filter(set,label){ext=set;chip.replaceChildren();if(set)chip.append('filter: '+label+' ',el('a',{href:'#',onclick:e=>{e.preventDefault();api.filter(null);}},'clear'));draw();}};return api;}
 const UIDX=new Map(D.units.map((u,i)=>[u.id,i]));
 // Rows may carry hidden extras after the visible columns: [payload ids] and an optional comparison sequence.
+function injected(host,sections){for(const section of sections||[]){host.appendChild(el('div',{class:'muted'},'Injected section'+(section.layer?' (layer: '+section.layer+')':'')));host.appendChild(el('pre',null,section.text));}}
 function rowDetail(det,heads,r){const ids=r[heads.length]||[],seq=r[heads.length+1],pos=r[heads.length+2];
 const kv=el('table',{class:'kv'},el('tbody',null,...heads.map((h,i)=>el('tr',null,el('th',null,h),el('td',null,String(r[i]==null?'':r[i]))))));
 det.replaceChildren(el('h4',null,'Selected entry'),kv);
@@ -1270,7 +1371,7 @@ det.appendChild(el('div',{class:'muted'},fmt(ids.length)+' payload(s) \u2014 ',
 el('a',{href:'#s-pay',onclick:()=>PAYTABLE&&PAYTABLE.filter(new Set(ids.map(x=>UIDX.get(x)).filter(x=>x!=null)),'selected evolution entry')},'show them in the payload table')));
 for(const id of ids.slice(0,20)){const u=D.units[UIDX.get(id)];if(!u)continue;
 det.appendChild(el('div',{class:'muted'},phTag(u.phase),' Unit '+u.id+' | '+u.site+u.path+' param '+u.param+' | '+u.first+' to '+u.last+' | source IPs: '+(ipl(u.ips)||'n/a')+' | statuses '+(u.statuses.join(', ')||'n/a')+' | '+u.count+' request(s)'));
-det.appendChild(el('pre',null,u.value+(u.truncated?'\n[value truncated at 4000 characters]':'')));}
+det.appendChild(el('pre',null,u.value+(u.truncated?'\n[value truncated at 4000 characters]':'')));injected(det,u.injected);}
 if(ids.length>20)det.appendChild(el('div',{class:'muted'},fmt(ids.length-20)+' more payload(s): use the link above.'));det.scrollIntoView({block:'nearest'});}
 function simple(host,heads,rows,sort,dir){if(!rows.length)return;const t=el('div');host.appendChild(t);const det=el('div',{class:'det'});
 const click=rows.some(r=>Array.isArray(r[heads.length]));const api=table(t,heads.map((h,i)=>[h,r=>r[i]]),rows,{sort:sort||0,dir:dir||1,lim:500,onclick:click?r=>rowDetail(det,heads,r):null});
@@ -1396,7 +1497,7 @@ d.appendChild(g);
 const f=k=>E[k].filter(r=>r[0]===c.id);const sec=(h,heads,rows,s)=>{if(rows.length){d.appendChild(el('h4',null,h));simple(d,heads,rows,s||0);}};
 sec('DBMS fingerprint',['DBMS','Payloads','First','Last','Markers'],f('dbms').map(r=>[r[1],r[2],isoS(r[3]),isoS(r[4]),r[5],r[6]]));
 sec('Database objects',['Kind','Name','First','Last','Payloads'],f('objects').map(r=>[r[1],r[2],isoS(r[3]),isoS(r[4]),r[5],r[6]]),2);
-sec('Error-channel extraction',['First seen (UTC)','Requests','Statuses','Error function','Submitted subquery','Table / view','Row selector'],f('error_channel').map(r=>[isoS(r[1]),r[2],r[3],r[4],r[5],r[6],r[7],r[8]]));
+sec('Error-channel extraction',['First seen (UTC)','Requests','Statuses','Error expression','Submitted subquery','Table / view','Row selector'],f('error_channel').map(r=>[isoS(r[1]),r[2],r[3],r[4],r[5],r[6],r[7],r[8]]));
 sec('Values read by blind inference',VH.slice(1),f('strings').map(r=>vrow(r).slice(1)),6);
 sec('Commands and expressions',['Command / expression','Family','First','Last','Payloads'],f('commands').map(r=>[r[1],r[2],isoS(r[3]),isoS(r[4]),r[5],r[6]]),2);
 sec('External references',['Kind','Value','First','Last','Payloads'],f('callbacks').map(r=>[r[1],r[2],isoS(r[3]),isoS(r[4]),r[5],r[6]]),2);
@@ -1405,7 +1506,7 @@ sec('Files requested',['OS','File','Max depth','Wrappers','UNC hosts','First','L
 sec('Requested URLs / hosts / ports',['Parameter','URL','Host','Port','Scheme','First','Last','Payloads'],f('ssrf').map(r=>[r[1],r[2],r[3],r[4],r[5],isoS(r[6]),isoS(r[7]),r[8],r[9]]),5);
 sec('Script injection vectors',['Parameter','Vector','Rules','First','Last','Payloads'],f('xss').map(r=>[r[1],r[2],r[3],isoS(r[4]),isoS(r[5]),r[6],r[7]]),3);
 const om=Object.entries(c.omitted);if(om.length)d.appendChild(el('p',{class:'muted'},'Not listed (size limit): '+om.map(x=>x[1]+' '+x[0]).join(', ')));
-d.appendChild(el('h4',null,'Example payloads per stage'));for(const l of lanes){d.appendChild(el('div',{class:'muted'},l.replace('|',': ')));for(const v of c.examples[l]||[])d.appendChild(el('pre',null,v));}}})();
+d.appendChild(el('h4',null,'Example payloads per stage'));for(const l of lanes){d.appendChild(el('div',{class:'muted'},l.replace('|',': ')));(c.examples[l]||[]).forEach((v,i)=>{d.appendChild(el('pre',null,v));injected(d,(c.example_sections[l]||[])[i]);});}}})();
 // ---- per-category and per-target aggregates
 (function(){const host=document.getElementById('agg');const g=new Map();
 for(const u of D.units){const key=[u.cat,u.site,u.path,u.param,u.rules.join(' ')].join('\u0001');let a=g.get(key);
@@ -1428,7 +1529,7 @@ PAYTABLE=table(host,[['Unit',r=>r.id],['Category',r=>r.cat,r=>tag(r.cat)],['Camp
 ['Phase',r=>r.phase,r=>phTag(r.phase)],['Stage',r=>r.lane],['First seen',r=>r.first],['Requests',r=>r.count],['Summary',r=>r.summary]],D.units,{sort:9,catFilter:true,search:r=>r.value+' '+(r.ips||[]).join(' '),onclick:u=>{
 det.replaceChildren(el('h3',null,'Unit '+u.id+' ',tag(u.cat),phTag(u.phase),u.related?infTag():null),
 el('p',null,u.summary),el('p',{class:'muted'},'Technique: '+u.rules.map(r=>tname(r)+(r.startsWith('related:')?'':' ('+r+')')).join('; ')+' | stage '+u.lane+' | campaign '+(u.camp||'-')+' | '+u.site+u.path+' param '+u.param+(u.ntargets>1?' (+'+(u.ntargets-1)+' more targets)':'')+' | source IPs: '+(ipl(u.ips)||'n/a')+' | statuses '+(u.statuses.join(', ')||'n/a')+' | '+u.first+' to '+u.last),
-el('div',{class:'muted'},'Decoded value'+(u.truncated?' (truncated)':'')+':'),el('pre',null,u.value));det.scrollIntoView({block:'nearest'});}});
+el('div',{class:'muted'},'Decoded value'+(u.truncated?' (truncated)':'')+':'),el('pre',null,u.value));injected(det,u.injected);det.scrollIntoView({block:'nearest'});}});
 host.appendChild(det);})();
 (function(){const f=document.getElementById('focus');f.value=FOCUS;f.addEventListener('change',()=>{const v=f.value.trim();const u=new URL(location.href);if(v)u.searchParams.set('focus',v);else u.searchParams.delete('focus');u.hash='';location.href=u.toString();});
 if(FOCUS){const m=document.querySelector('main');const u=new URL(location.href);u.searchParams.delete('focus');

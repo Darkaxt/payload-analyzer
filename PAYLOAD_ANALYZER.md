@@ -6,6 +6,10 @@ Python 3.10+, standard library only. No network, model service or payload execut
 
 Value-returning subqueries submitted inside error functions are classified as data extraction / inference and exploitation attempts, including dictionary and schema reads. Constant-only errors remain probes; boolean-blind checks retain their existing classification. Campaign evolution lists the submitted error function, full verbatim subquery, referenced tables/views and row selectors with first-seen time, request count and statuses. Focus mode filters these entries; the executive summary counts the payloads. These descriptions do not establish successful extraction or impact.
 
+## Injected section (1.9.2)
+
+Campaign examples and entry details retain their payload and add an untruncated, evidence-based Injected section when different from the whole value. JSON leaves include their key paths; deeper decoding layers are labelled. Error-based sections and the Error expression column retain complete balanced error calls alongside submitted subqueries. These excerpts make no claim about success or impact. Sections are computed once per displayed attack unit.
+
 ## Recommended pipeline
 
 ```
